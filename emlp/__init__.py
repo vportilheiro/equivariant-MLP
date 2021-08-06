@@ -12,4 +12,4 @@
 __version__ = '0.9.1'
 from .nn import *
 from .groups import *
-from .reps import *
+#from .reps import *

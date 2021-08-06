@@ -35,9 +35,9 @@ class Linear(nn.Linear):
         self.w = TrainVar(orthogonal((nout, nin)))
         self.rep_W = rep_W = repout*repin.T
         
-        rep_bias = repout
-        self.Pw = rep_W.equivariant_projector()
-        self.Pb = rep_bias.equivariant_projector()
+        self.rep_bias = rep_bias = repout
+        self.Pw, self.loss_w = rep_W.equivariant_projector()
+        self.Pb, self.loss_b = rep_bias.equivariant_projector()
         logging.info(f"Linear W components:{rep_W.size()} rep:{rep_W}")
     def __call__(self, x): # (cin) -> (cout)
         logging.debug(f"linear in shape: {x.shape}")
@@ -46,6 +46,15 @@ class Linear(nn.Linear):
         out = x@W.T+b
         logging.debug(f"linear out shape:{out.shape}")
         return out
+
+@ export
+class ProjectorRecomputingLinear(Linear):
+    """ Clone of equivariant Linear layer which updates the equivariant projector
+        on each call. """
+    def __call__(self, x):
+        self.Pw, self.loss_w = self.rep_W.equivariant_projector()
+        self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
+        return super().__call__(x)
 
 @export
 class BiLinear(Module):
@@ -88,9 +97,9 @@ class GatedNonlinearity(Module): #TODO: add support for mixed tensors and non su
 class EMLPBlock(Module):
     """ Basic building block of EMLP consisting of G-Linear, biLinear,
         and gated nonlinearity. """
-    def __init__(self,rep_in,rep_out):
+    def __init__(self,rep_in,rep_out, LinearClass=Linear):
         super().__init__()
-        self.linear = Linear(rep_in,gated(rep_out))
+        self.linear = LinearClass(rep_in,gated(rep_out))
         self.bilinear = BiLinear(gated(rep_out),gated(rep_out))
         self.nonlinearity = GatedNonlinearity(rep_out)
     def __call__(self,x):
@@ -105,7 +114,7 @@ def uniform_rep_general(ch,*rep_types):
     raise NotImplementedError
 
 @export
-def uniform_rep(ch,group):
+def uniform_rep(ch,group,tensor_constructor=T):
     """ A heuristic method for allocating a given number of channels (ch)
         into tensor types. Attempts to distribute the channels evenly across
         the different tensor types. Useful for hands off layer construction.
@@ -113,6 +122,7 @@ def uniform_rep(ch,group):
         Args:
             ch (int): total number of channels
             group (Group): symmetry group
+            TensorConstructor: a function with the same API as T() exported by emlp.nn.reps
 
         Returns:
             SumRep: The direct sum representation with dim(V)=ch
@@ -123,7 +133,7 @@ def uniform_rep(ch,group):
         max_rank = lambertW(ch,d) # compute the max rank tensor that can fit up to
         Ns[:max_rank+1] += np.array([d**(max_rank-r) for r in range(max_rank+1)],dtype=int)
         ch -= (max_rank+1)*d**max_rank # compute leftover channels
-    sum_rep = sum([binomial_allocation(nr,r,group) for r,nr in enumerate(Ns)])
+    sum_rep = sum([binomial_allocation(nr,r,group,tensor_constructor) for r,nr in enumerate(Ns)])
     sum_rep,perm = sum_rep.canonicalize()
     return sum_rep
 
@@ -135,7 +145,7 @@ def lambertW(ch,d):
     max_rank -= 1
     return max_rank
 
-def binomial_allocation(N,rank,G):
+def binomial_allocation(N,rank,G,tensor_constructor=T):
     """ Allocates N of tensors of total rank r=(p+q) into
         T(k,r-k) for k=0,1,...,r to match the binomial distribution.
         For orthogonal representations there is no
@@ -143,19 +153,19 @@ def binomial_allocation(N,rank,G):
     if N==0: return 0
     n_binoms = N//(2**rank)
     n_leftover = N%(2**rank)
-    even_split = sum([n_binoms*int(binom(rank,k))*T(k,rank-k,G) for k in range(rank+1)])
+    even_split = sum([n_binoms*int(binom(rank,k))*tensor_constructor(k,rank-k,G) for k in range(rank+1)])
     ps = np.random.binomial(rank,.5,n_leftover)
-    ragged = sum([T(int(p),rank-int(p),G) for p in ps])
+    ragged = sum([tensor_constructor(int(p),rank-int(p),G) for p in ps])
     out = even_split+ragged
     return out
 
-def uniform_allocation(N,rank):
+def uniform_allocation(N,rank,tensor_constructor=T):
     """ Uniformly allocates N of tensors of total rank r=(p+q) into
         T(k,r-k) for k=0,1,...,r. For orthogonal representations there is no
         distinction between p and q, so this op is equivalent to N*T(rank)."""
     if N==0: return 0
-    even_split = sum((N//(rank+1))*T(k,rank-k) for k in range(rank+1))
-    ragged = sum(random.sample([T(k,rank-k) for k in range(rank+1)],N%(rank+1)))
+    even_split = sum((N//(rank+1))*tensor_constructor(k,rank-k) for k in range(rank+1))
+    ragged = sum(random.sample([tensor_constructor(k,rank-k) for k in range(rank+1)],N%(rank+1)))
     return even_split+ragged
 
 @export
@@ -195,6 +205,55 @@ class EMLP(Module,metaclass=Named):
         )
     def __call__(self,x,training=True):
         return self.network(x)
+
+@export
+class LearnedGroupEMLP(Module):
+    """ EMLP with "learned equivariance." Same args as EMLP, but rep_in and rep_out
+        must be of class FixedRankRep, and ranks of inner representations must be 
+        be specified as well. """
+    
+    def __init__(self, rep_in, rep_out, group, middle_rep_rank=2, ch=10, num_layers=3):
+        super().__init__()
+        assert type(middle_rep_rank) == type(ch)
+        if type(middle_rep_rank) is list:
+            assert len(middle_rep_rank) == len(ch) == num_layers
+        logging.info("Initing LearnedGroupEMLP (objax)")
+        self.rep_in = rep_in(group)
+        self.rep_out = rep_out(group)
+        self.middle_rep_rank = middle_rep_rank
+        
+        self.G=group
+
+        # Parse ch as a single int, a sequence of ints, a single Rep, a sequence of Reps
+        if isinstance(ch,int):
+            tensor_constructor = lambda p,q=0,G=None: T(middle_rep_rank,p,q,G)
+            middle_layers = num_layers*[uniform_rep(ch,group,tensor_constructor)]
+        elif isinstance(ch,FixedRankRep):
+            middle_layers = num_layers*[ch(group)]
+        else: 
+            tensor_constructors = ((lambda p,q=0,G=None: T(rank,p,q,G)) for rank in middle_rep_rank)
+            middle_layers = [(c(group) if isinstance(c,FixedRankRep) \
+                             else uniform_rep(c,group,T)) for c,T in zip(ch, tensor_constructors)]
+        #assert all((not rep.G is None) for rep in middle_layers[0].reps)
+        reps = [self.rep_in]+middle_layers
+        logging.info(f"Reps: {reps}")
+        self.network = Sequential(
+            *[EMLPBlock(rin,rout,LinearClass=ProjectorRecomputingLinear) for rin,rout in zip(reps,reps[1:])],
+            ProjectorRecomputingLinear(reps[-1],self.rep_out)
+        )
+
+    def __call__(self,x,training=True):
+        return self.network(x)
+
+    def null_space_loss(self):
+        """ Returns the sum of null_space_loss terms for each linear map representation.
+            Note this means that the same representation's loss can count multiple times,
+            across different EMLPBlocks. """
+        result = 0
+        for block in self.network[:-1]:
+            result += block.linear.loss_w + block.linear.loss_b
+        result += self.network[-1].loss_w + self.network[-1].loss_b
+        return result
 
 def swish(x):
     return jax.nn.sigmoid(x)*x

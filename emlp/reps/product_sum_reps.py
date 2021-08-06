@@ -30,6 +30,9 @@ class SumRep(Rep):
     def size(self):
         return sum(rep.size()*count for rep,count in self.reps.items())
 
+    def rank(self):
+        return sum(rep.rank()*count for rep,count in self.reps.items())
+
     def rho(self,M):
         rhos = [rep.rho(M) for rep in self.reps]
         multiplicities = self.reps.values()
@@ -75,22 +78,30 @@ class SumRep(Rep):
     def equivariant_basis(self):
         """ Overrides default implementation with a more efficient version which decomposes the constraints
             across the sum."""
-        Qs = {rep: rep.equivariant_basis() for rep in self.reps}
+        Qs = {}
+        losses = {}
+        for rep in self.reps:
+            Qs[rep], losses[rep] = rep.equivariant_basis()
         Qs = {rep: (jax.device_put(Q.astype(np.float32)) if isinstance(Q,(np.ndarray)) else Q) for rep,Q in Qs.items()}
         active_dims = sum([self.reps[rep]*Qs[rep].shape[-1] for rep in Qs.keys()])
         multiplicities = self.reps.values()
         def lazy_Q(array):
             return lazy_direct_matmat(array,Qs.values(),multiplicities)[self.invperm]
-        return LinearOperator(shape=(self.size(),active_dims),matvec=lazy_Q,matmat=lazy_Q)
+        loss = sum(losses[rep] * count for rep,count in self.reps.items())
+        return LinearOperator(shape=(self.size(),active_dims),matvec=lazy_Q,matmat=lazy_Q), loss
 
     def equivariant_projector(self):
         """ Overrides default implementation with a more efficient version which decomposes the constraints
             across the sum."""
-        Ps = {rep:rep.equivariant_projector() for rep in self.reps}
+        Ps = {}
+        losses = {}
+        for rep in self.reps:
+            Ps[rep], losses[rep] = rep.equivariant_projector()
         multiplicities = self.reps.values()
         def lazy_P(array):
             return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
-        return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
+        loss = sum(losses[rep] * count for rep,count in self.reps.items())
+        return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P), loss
 
     # ##TODO: investigate why these more idiomatic definitions with Lazy Operators end up slower
     # def equivariant_basis(self):
@@ -265,6 +276,9 @@ class ProductRep(Rep):
 
     def size(self):
         return product([rep.size()**count for rep,count in self.reps.items()])
+    
+    def rank(self):
+        return product([rep.rank()**count for rep,count in self.reps.items()])
 
     def rho(self,Ms,lazy=False):
         if hasattr(self,'G') and isinstance(Ms,dict): Ms=Ms[self.G]
@@ -372,12 +386,24 @@ class DirectProduct(ProductRep):
         assert all(count==1 for count in self.reps.values())
 
     def equivariant_basis(self):
-        canon_Q = LazyKron([rep.equivariant_basis() for rep,c in self.reps.items()])
-        return LazyPerm(self.invperm)@canon_Q
+        Qs = []
+        losses = {}
+        for rep in self.reps:
+            Q, losses[rep] = rep.equivariant_basis() 
+            Qs.append(Q)
+        canon_Q = LazyKron(Qs)
+        loss = reduce(lambda x,y: x*y, (losses[rep]**count for rep,count in self.reps.items()))
+        return LazyPerm(self.invperm)@canon_Q, loss
 
     def equivariant_projector(self):
-        canon_P = LazyKron([rep.equivariant_projector() for rep,c in self.reps.items()])
-        return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
+        Ps = []
+        losses = {}
+        for rep in self.reps:
+            P, losses[rep] = rep.equivariant_projector()
+            Ps.append(P)
+        canon_P = LazyKron(Ps)
+        loss = reduce(lambda x,y: x*y, (losses[rep]**count for rep,count in self.reps.items()))
+        return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm), loss
 
     def rho(self,Ms):
         canonical_lazy = LazyKron([rep.rho(Ms) for rep,c in self.reps.items() for _ in range(c)])

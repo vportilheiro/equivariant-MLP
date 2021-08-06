@@ -69,6 +69,13 @@ class Rep(object):
             return self._size
         else: raise NotImplementedError
 
+    def rank(self):
+        """ Rank of basis treated as equivariant """
+        if hasattr(self, '_rank'):
+            return self._rank
+        else:
+            raise NotImplementedError
+
     def canonicalize(self): 
         """ An optional method to convert the representation into a canonical form
             in order to reuse equivalent solutions in the solver. Should return
@@ -94,32 +101,25 @@ class Rep(object):
         constraints.extend([lazify(self.drho(A)) for A in self.G.lie_algebra])
         return ConcatLazy(constraints) if constraints else lazify(jnp.zeros((1,n)))
 
-    solcache = {}
+    # TODO: is there a way to cache the results here?
     def equivariant_basis(self):  
-        """ Computes the equivariant solution basis for the given representation of size N.
-            Canonicalizes problems and caches solutions for reuse. Output [Q (N,r)] """
-        if self==Scalar: return jnp.ones((1,1))
-        canon_rep,perm = self.canonicalize()
-        invperm = np.argsort(perm)
-        if canon_rep not in self.solcache:
-            logging.info(f"{canon_rep} cache miss")
-            logging.info(f"Solving basis for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
-            #if isinstance(group,Trivial): return np.eye(size(rank,group.d))
-            C_lazy = canon_rep.constraint_matrix()
-            if C_lazy.shape[0]*C_lazy.shape[1]>3e7: #Too large to use SVD
-                result = krylov_constraint_solve(C_lazy)
-            else:
-                C_dense = C_lazy.to_dense()
-                result = orthogonal_complement(C_dense)
-            self.solcache[canon_rep]=result
-        return self.solcache[canon_rep][invperm]
+        """ Returns the basis corresponding to the smallest k=self.rank() singular values,
+            and a null_space_loss: the sum of the squares of said singular values. """
+        if self==Scalar: return jnp.ones((1,1)), 0
+        k = self.rank()
+        C_lazy = self.constraint_matrix()
+        C_dense = C_lazy.to_dense()
+        U, S, Vh = jnp.linalg.svd(C_dense,full_matrices=False)
+        null_space_loss = jnp.linalg.norm(S[-k:])**2
+        Q = Vh[-k:].conj().T
+        return Q, null_space_loss
     
     def equivariant_projector(self):
         """ Computes the (lazy) projection matrix P=QQᵀ that projects to the equivariant basis."""
-        Q = self.equivariant_basis()
+        Q, null_space_loss = self.equivariant_basis()
         Q_lazy = lazify(Q)
         P = Q_lazy@Q_lazy.H
-        return P
+        return P, null_space_loss
 
     @property
     def concrete(self):
@@ -208,6 +208,8 @@ class ScalarRep(Rep):
         return self
     def size(self):
         return 1
+    def rank(self):
+        return 0
     def __repr__(self): return str(self)#f"T{self.rank+(self.G,)}"
     def __str__(self):
         return "V⁰"
@@ -234,11 +236,12 @@ class ScalarRep(Rep):
 
 class Base(Rep):
     """ Base representation V of a group."""
-    def __init__(self,G=None):
+    def __init__(self,rank,G=None):
         self.G=G
+        self._rank=rank
         if G is not None: self.is_permutation = G.is_permutation
     def __call__(self,G):
-        return self.__class__(G)
+        return self.__class__(self.rank(),G)
     def rho(self,M):
         if hasattr(self,'G') and isinstance(M,dict): M=M[self.G]
         return M
@@ -251,6 +254,7 @@ class Base(Rep):
     def __repr__(self): return str(self)#f"T{self.rank+(self.G,)}"
     def __str__(self):
         return "V"# +(f"_{self.G}" if self.G is not None else "")
+        return f"Vᵣ₌{chr(0x2080 + self.rank())}"
     
     def __hash__(self):
         return hash((type(self),self.G))
@@ -291,127 +295,23 @@ class Dual(Rep):
         return super().__lt__(other)
     def size(self):
         return self.rep.size()
-        
-V=Vector= Base()  #: Alias V or Vector for an instance of the Base representation of a group
+    def rank(self):
+        return self.rep.rank()
+
+V=Vector= (lambda rank: Base(rank))  #: Alias V or Vector for an instance of the Base representation of a group
 
 Scalar = ScalarRep()#: An instance of the Scalar representation, equivalent to V**0
 
+#@export
+#def T(p,q=0,G=None):
+#    """ A convenience function for creating rank (p,q) tensors."""
+#    return (V**p*V.T**q)(G)
 @export
-def T(p,q=0,G=None):
+def T(rank,p,q=0,G=None):
     """ A convenience function for creating rank (p,q) tensors."""
-    return (V**p*V.T**q)(G)
-
-def orthogonal_complement(proj):
-    """ Computes the orthogonal complement to a given matrix proj"""
-    U,S,VH = jnp.linalg.svd(proj,full_matrices=True)
-    rank = (S>1e-5).sum()
-    return VH[rank:].conj().T
-
-def krylov_constraint_solve(C,tol=1e-5):
-    """ Computes the solution basis Q for the linear constraint CQ=0  and QᵀQ=I
-        up to specified tolerance with C expressed as a LinearOperator. """
-    r = 5
-    if C.shape[0]*r*2>2e9: raise Exception(f"Solns for contraints {C.shape} too large to fit in memory")
-    found_rank=5
-    while found_rank==r:
-        r *= 2 # Iterative doubling of rank until large enough to include the full solution space
-        if C.shape[0]*r>2e9:
-            logging.error(f"Hit memory limits, switching to sample equivariant subspace of size {found_rank}")
-            break
-        Q = krylov_constraint_solve_upto_r(C,r,tol)
-        found_rank = Q.shape[-1]
-    return Q
-
-def krylov_constraint_solve_upto_r(C,r,tol=1e-5,lr=1e-2):#,W0=None):
-    """ Iterative routine to compute the solution basis to the constraint CQ=0 and QᵀQ=I
-        up to the rank r, with given tolerance. Uses gradient descent (+ momentum) on the
-        objective |CQ|^2, which provably converges at an exponential rate."""
-    W = np.random.randn(C.shape[-1],r)/np.sqrt(C.shape[-1])# if W0 is None else W0
-    W = device_put(W)
-    opt_init,opt_update = optax.sgd(lr,.9)
-    opt_state = opt_init(W)  # init stats
-
-    def loss(W):
-        return (jnp.absolute(C@W)**2).sum()/2 # added absolute for complex support
-
-    loss_and_grad = jit(jax.value_and_grad(loss))
-    # setup progress bar
-    pbar = tqdm(total=100,desc=f'Krylov Solving for Equivariant Subspace r<={r}',
-    bar_format="{l_bar}{bar}| {n:.3g}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
-    prog_val = 0
-    lstart, _ = loss_and_grad(W)
-    
-    for i in range(20000):
-        
-        lossval, grad = loss_and_grad(W)
-        updates, opt_state = opt_update(grad, opt_state, W)
-        W = optax.apply_updates(W, updates)
-        # update progress bar
-        progress = max(100*np.log(lossval/lstart)/np.log(tol**2/lstart)-prog_val,0)
-        progress = min(100-prog_val,progress)
-        if progress>0:
-            prog_val += progress
-            pbar.update(progress)
-
-        if jnp.sqrt(lossval) <tol: # check convergence condition
-            pbar.close()
-            break # has converged
-        if lossval>2e3 and i>100: # Solve diverged due to too high learning rate
-            logging.warning(f"Constraint solving diverged, trying lower learning rate {lr/3:.2e}")
-            if lr < 1e-4: raise ConvergenceError(f"Failed to converge even with smaller learning rate {lr:.2e}")
-            return krylov_constraint_solve_upto_r(C,r,tol,lr=lr/3)
-    else: raise ConvergenceError("Failed to converge.")
-    # Orthogonalize solution at the end
-    U,S,VT = np.linalg.svd(np.array(W),full_matrices=False) 
-    # Would like to do economy SVD here (to not have the unecessary O(n^2) memory cost) 
-    # but this is not supported in numpy (or Jax) unfortunately.
-    rank = (S>10*tol).sum()
-    Q = device_put(U[:,:rank])
-    # final_L
-    final_L = loss_and_grad(Q)[0]
-    if final_L >tol: logging.warning(f"Normalized basis has too high error {final_L:.2e} for tol {tol:.2e}")
-    scutoff = (S[rank] if r>rank else 0)
-    assert rank==0 or scutoff < S[rank-1]/100, f"Singular value gap too small: {S[rank-1]:.2e} \
-        above cutoff {scutoff:.2e} below cutoff. Final L {final_L:.2e}, earlier {S[rank-5:rank]}"
-    #logging.debug(f"found Rank {r}, above cutoff {S[rank-1]:.3e} after {S[rank] if r>rank else np.inf:.3e}. Loss {final_L:.1e}")
-    return Q
+    return (V(rank)**p*V(rank).T**q)(G)
 
 class ConvergenceError(Exception): pass
-
-@export
-def sparsify_basis(Q,lr=1e-2): #(n,r)
-    """ Convenience function to attempt to sparsify a given basis by applying an orthogonal transformation
-        W, Q' = QW where Q' has only 1s, 0s and -1s. Notably this method does not have the same convergence
-        gauruntees of krylov_constraint_solve and can fail (even silently). Intended to be used only for
-        visualization purposes, use at your own risk. """
-    W = np.random.randn(Q.shape[-1],Q.shape[-1])
-    W,_ = np.linalg.qr(W)
-    W = device_put(W.astype(jnp.float32))
-    opt_init,opt_update = optax.adam(lr)#optax.sgd(1e2,.9)#optax.adam(lr)#optax.sgd(3e-3,.9)#optax.adam(lr)
-    opt_update = jit(opt_update)
-    opt_state = opt_init(W)  # init stats
-
-    def loss(W):
-        return jnp.abs(Q@W.T).mean() + .1*(jnp.abs(W.T@W-jnp.eye(W.shape[0]))).mean()+.01*jax.numpy.linalg.slogdet(W)[1]**2
-
-    loss_and_grad = jit(jax.value_and_grad(loss))
-
-    for i in tqdm(range(3000),desc=f'sparsifying basis'):
-        lossval, grad = loss_and_grad(W)
-        updates, opt_state = opt_update(grad, opt_state, W)
-        W = optax.apply_updates(W, updates)
-        #W,_ = np.linalg.qr(W)
-        if lossval>1e2 and i>100: # Solve diverged due to too high learning rate
-            logging.warning(f"basis sparsification diverged, trying lower learning rate {lr/3:.2e}")
-            return sparsify_basis(Q,lr=lr/3)
-    Q = np.copy(Q@W.T)
-    Q[np.abs(Q)<1e-2]=0
-    Q[np.abs(Q)>1e-2] /= np.abs(Q[np.abs(Q)>1e-2])
-    A = Q@(1+np.arange(Q.shape[-1]))
-    if len(np.unique(np.abs(A)))!=Q.shape[-1]+1 and len(np.unique(np.abs(A)))!=Q.shape[-1]:
-        logging.error(f"Basis elems did not separate: found only {len(np.unique(np.abs(A)))}/{Q.shape[-1]}")
-        #raise ConvergenceError(f"Basis elems did not separate: found only {len(np.unique(A))}/{Q.shape[-1]}")
-    return Q
 
 #@partial(jit,static_argnums=(0,1))
 @export
@@ -464,8 +364,8 @@ def vis(repin,repout,cluster=True):
         as an image. Only use cluster=True if you know Pv will only have
         r distinct values (true for G<S(n) but not true for many continuous groups)."""
     rep = (repin>>repout)
-    P = rep.equivariant_projector() # compute the equivariant basis
-    Q = rep.equivariant_basis()
+    P,_ = rep.equivariant_projector() # compute the equivariant basis
+    Q,_ = rep.equivariant_basis()
     v = np.random.randn(P.shape[1])  # sample random vector
     v = np.round(P@v,decimals=4)  # project onto equivariant subspace (and round)
     if cluster: # cluster nearby values for better color separation in plot
