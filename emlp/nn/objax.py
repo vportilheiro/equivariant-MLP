@@ -29,6 +29,7 @@ def Sequential(*args):
 class Linear(nn.Linear):
     """ Basic equivariant Linear layer from repin to repout."""
     def __init__(self, repin, repout):
+        self.repin, self.repout = repin, repout
         nin,nout = repin.size(),repout.size()
         super().__init__(nin,nout)
         self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
