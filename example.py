@@ -1,3 +1,9 @@
+#####
+# This file contains a simple experiment for learning groups using the "null space loss".
+# The map we are trying to learn --- the linear map W --- is made to be equivariant under
+# the symmetric group.
+#####
+
 import emlp
 from emlp.learned_group import LearnedGroup
 from emlp.groups import S
