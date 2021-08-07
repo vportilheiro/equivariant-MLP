@@ -35,6 +35,7 @@ Several algorithms in the ``scipy.sparse`` library are able to operate on
 import warnings
 
 import jax.numpy as np
+import torch
 
 __all__ = ['LinearOperator', 'aslinearoperator']
 
@@ -135,14 +136,11 @@ class LinearOperator(object):
         To be called by subclasses. ``dtype`` may be None; ``shape`` should
         be convertible to a length-2 tuple.
         """
-        if dtype is not None:
-            dtype = np.dtype(dtype)
-
         shape = tuple(shape)
         if not isshape(shape):
             raise ValueError("invalid shape %r (must be 2-d)" % (shape,))
 
-        self.dtype = np.dtype('float32') #force float 32
+        self.dtype = torch.float32 #force float 32
         self.shape = shape
 
     def _init_dtype(self):
@@ -150,7 +148,7 @@ class LinearOperator(object):
         """
         if self.dtype is None:
             #v = np.zeros(self.shape[-1])
-            self.dtype = np.dtype('float32')#self.matvec(v).dtype #force float 32
+            self.dtype = torch.float32 #self.matvec(v).dtype #force float 32
 
     def _matmat(self, X):
         """Default matrix-matrix multiplication handler.
@@ -158,7 +156,7 @@ class LinearOperator(object):
         define matrix multiplication (though in a very suboptimal way).
         """
 
-        return np.hstack([self.matvec(col.reshape(-1,1)) for col in X.T])
+        return torch.hstack([self.matvec(col.reshape(-1,1)) for col in X.T])
 
     def _matvec(self, x):
         """Default matrix-vector multiplication handler.
@@ -308,7 +306,7 @@ class LinearOperator(object):
     def _rmatmat(self, X):
         """Default implementation of _rmatmat defers to rmatvec or adjoint."""
         if type(self)._adjoint == LinearOperator._adjoint:
-            return np.hstack([self.rmatvec(col.reshape(-1, 1)) for col in X.T])
+            return torch.hstack([self.rmatvec(col.reshape(-1, 1)) for col in X.T])
         else:
             return self.H.matmat(X)
 
@@ -370,7 +368,7 @@ class LinearOperator(object):
     def __add__(self, x):
         if isinstance(x, LinearOperator):
             return _SumLinearOperator(self, x)
-        elif isinstance(x,np.ndarray) and len(x.shape)==2:
+        elif isinstance(x,torch.Tensor) and len(x.shape)==2:
             return _SumLinearOperator(self, Lazy(x))
         else:
             return NotImplemented
@@ -427,7 +425,7 @@ class LinearOperator(object):
         """ Default implementation of to_dense which produces the dense
             matrix corresponding to the given lazy matrix. Defaults to
             multiplying by the identity """
-        return self@np.eye(self.shape[-1])
+        return self@torch.eye(self.shape[-1])
 
 
 class _CustomLinearOperator(LinearOperator):
@@ -506,17 +504,17 @@ class _TransposedLinearOperator(LinearOperator):
 
     def _matvec(self, x):
         # NB. np.conj works also on sparse matrices
-        return np.conj(self.A._rmatvec(np.conj(x)))
+        return torch.conj(self.A._rmatvec(torch.conj(x)))
 
     def _rmatvec(self, x):
-        return np.conj(self.A._matvec(np.conj(x)))
+        return torch.conj(self.A._matvec(torch.conj(x)))
 
     def _matmat(self, x):
         # NB. np.conj works also on sparse matrices
-        return np.conj(self.A._rmatmat(np.conj(x)))
+        return torch.conj(self.A._rmatmat(torch.conj(x)))
 
     def _rmatmat(self, x):
-        return np.conj(self.A._matmat(np.conj(x)))
+        return torch.conj(self.A._matmat(torch.conj(x)))
 
 def _get_dtype(operators, dtypes=None):
     if dtypes is None:
@@ -610,17 +608,17 @@ class _ScaledLinearOperator(LinearOperator):
         return self.args[1] * self.args[0].matvec(x)
 
     def _rmatvec(self, x):
-        return np.conj(self.args[1]) * self.args[0].rmatvec(x)
+        return torch.conj(self.args[1]) * self.args[0].rmatvec(x)
 
     def _rmatmat(self, x):
-        return np.conj(self.args[1]) * self.args[0].rmatmat(x)
+        return torch.conj(self.args[1]) * self.args[0].rmatmat(x)
 
     def _matmat(self, x):
         return self.args[1] * self.args[0].matmat(x)
 
     def _adjoint(self):
         A, alpha = self.args
-        return A.H * np.conj(alpha)
+        return A.H * torch.conj(alpha)
     def invT(self):
         A, alpha = self.args
         return (1/alpha)*A.T
@@ -642,7 +640,7 @@ class _PowerLinearOperator(LinearOperator):
         self.args = (A, p)
 
     def _power(self, fun, x):
-        res = np.array(x, copy=True)
+        res = torch.Tensor(x, copy=True)
         for i in range(self.args[1]):
             res = fun(res)
         return res
@@ -733,7 +731,7 @@ class Lazy(LinearOperator):
     def to_dense(self):
         return self.A
     def invT(self):
-        return Lazy(np.linalg.inv(self.A).T)
+        return Lazy(torch.linalg.inv(self.A).T)
 
 
 # def aslinearoperator(A):
@@ -799,7 +797,7 @@ def isshape(x, nonneg=False):
         return False
     else:
         if isintlike(M) and isintlike(N):
-            if np.ndim(M) == 0 and np.ndim(N) == 0:
-                if not nonneg or (M >= 0 and N >= 0):
-                    return True
+            #if M.ndim == 0 and N.ndim == 0:
+            if not nonneg or (M >= 0 and N >= 0):
+                return True
         return False

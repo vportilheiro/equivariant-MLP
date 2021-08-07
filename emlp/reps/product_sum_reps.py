@@ -1,6 +1,4 @@
 import numpy as np
-import jax
-from jax import jit
 import collections,itertools
 from functools import lru_cache as cache
 from .representation import Rep,ScalarRep,Scalar
@@ -82,7 +80,6 @@ class SumRep(Rep):
         losses = {}
         for rep in self.reps:
             Qs[rep], losses[rep] = rep.equivariant_basis()
-        Qs = {rep: (jax.device_put(Q.astype(np.float32)) if isinstance(Q,(np.ndarray)) else Q) for rep,Q in Qs.items()}
         active_dims = sum([self.reps[rep]*Qs[rep].shape[-1] for rep in Qs.keys()])
         multiplicities = self.reps.values()
         def lazy_Q(array):

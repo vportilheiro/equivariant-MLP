@@ -3,18 +3,19 @@ import jax.numpy as jnp
 import numpy as np
 from jax import jit
 import jax
+import torch
 from functools import reduce
 
 product = lambda c: reduce(lambda a,b:a*b,c)
 
 def lazify(x):
     if isinstance(x,LinearOperator): return x
-    elif isinstance(x,(jnp.ndarray,np.ndarray)): return Lazy(x)
+    elif isinstance(x,(torch.Tensor,np.ndarray)): return Lazy(x)
     else: raise NotImplementedError
 
 def densify(x):
     if isinstance(x,LinearOperator): return x.to_dense()
-    elif isinstance(x,(jnp.ndarray,np.ndarray)): return x
+    elif isinstance(x,(torch.Tensor,np.ndarray)): return x
     else: raise NotImplementedError
 
 class I(LinearOperator):
@@ -43,9 +44,9 @@ class LazyKron(LinearOperator):
     def _matmat(self,v):
         ev = v.reshape(*[Mi.shape[-1] for Mi in self.Ms],-1)
         for i,M in enumerate(self.Ms):
-            ev_front = jnp.moveaxis(ev,i,0)
+            ev_front = torch.moveaxis(ev,i,0)
             Mev_front = (M@ev_front.reshape(M.shape[-1],-1)).reshape(M.shape[0],*ev_front.shape[1:])
-            ev = jnp.moveaxis(Mev_front,0,i)
+            ev = torch.moveaxis(Mev_front,0,i)
         return ev.reshape(self.shape[0],ev.shape[-1])
     def _adjoint(self):
         return LazyKron([Mi.T for Mi in self.Ms])
@@ -53,14 +54,14 @@ class LazyKron(LinearOperator):
         return LazyKron([M.invT() for M in self.Ms])
     def to_dense(self):
         Ms = [M.to_dense() if isinstance(M,LinearOperator) else M for M in self.Ms]
-        return reduce(jnp.kron,Ms)
+        return reduce(torch.kron,Ms)
     def __new__(cls,Ms):
         if len(Ms)==1: return Ms[0]
         return super().__new__(cls)
 
 #@jit
 def kronsum(A,B):
-    return jnp.kron(A,jnp.eye(B.shape[-1])) + jnp.kron(jnp.eye(A.shape[-1]),B)
+    return torch.kron(A,torch.eye(B.shape[-1])) + torch.kron(torch.eye(A.shape[-1]),B)
 
 
 class LazyKronsum(LinearOperator):
@@ -69,8 +70,7 @@ class LazyKronsum(LinearOperator):
         self.Ms = Ms
         shape = product([Mi.shape[0] for Mi in Ms]), product([Mi.shape[1] for Mi in Ms])
         #self.dtype=Ms[0].dtype
-        dtype=jnp.dtype('float32')
-        super().__init__(dtype,shape)
+        super().__init__(torch.float32,shape)
 
     def _matvec(self,v):
         return self._matmat(v).reshape(-1)
@@ -79,9 +79,9 @@ class LazyKronsum(LinearOperator):
         ev = v.reshape(*[Mi.shape[-1] for Mi in self.Ms],-1)
         out = 0*ev
         for i,M in enumerate(self.Ms):
-            ev_front = jnp.moveaxis(ev,i,0)
+            ev_front = torch.moveaxis(ev,i,0)
             Mev_front = (M@ev_front.reshape(M.shape[-1],-1)).reshape(M.shape[0],*ev_front.shape[1:])
-            out += jnp.moveaxis(Mev_front,0,i)
+            out += torch.moveaxis(Mev_front,0,i)
         return out.reshape(self.shape[0],ev.shape[-1])
         
     def _adjoint(self):
@@ -105,7 +105,7 @@ class LazyJVP(LinearOperator):
         self.shape = operator_fn(X).shape
         self.vjp = lambda v: jax.jvp(lambda x: operator_fn(x)@v,[X],[TX])[1]
         self.vjp_T = lambda v: jax.jvp(lambda x: operator_fn(x).T@v,[X],[TX])[1]
-        self.dtype=jnp.dtype('float32')
+        self.dtype=torch.float32
     def _matmat(self,v):
         return self.vjp(v)
     def _matvec(self,v):
@@ -125,13 +125,13 @@ class ConcatLazy(LinearOperator):
         super().__init__(None,shape)
 
     def _matmat(self,V):
-        return jnp.concatenate([M@V for M in self.Ms],axis=0)
+        return torch.cat([M@V for M in self.Ms],axis=0)
     def _rmatmat(self,V):
-        Vs = jnp.split(V,len(self.Ms))
+        Vs = torch.split(V,len(self.Ms))
         return sum([self.Ms[i].T@Vs[i] for i in range(len(self.Ms))])
     def to_dense(self):
         dense_Ms = [M.to_dense() if isinstance(M,LinearOperator) else M for M in self.Ms]
-        return jnp.concatenate(dense_Ms,axis=0)
+        return torch.cat(dense_Ms,axis=0)
     
 class LazyDirectSum(LinearOperator):
     def __init__(self,Ms,multiplicities=None):
@@ -170,7 +170,7 @@ def lazy_direct_matmat(v,Ms,mults):
         elems = M@v[i:i_end].T.reshape(k*multiplicity,M.shape[-1]).T
         y.append(elems.T.reshape(k,multiplicity*M.shape[0]).T)
         i = i_end
-    y = jnp.concatenate(y,axis=0) #concatenate over rep axis
+    y = torch.cat(y,axis=0) #concatenate over rep axis
     return  y
 
 
@@ -196,9 +196,9 @@ class LazyShift(LinearOperator):
         super().__init__(None,shape)
 
     def _matmat(self,V): #(c,k) #Still needs to be tested??
-        return jnp.roll(V,self.k,axis=0)
+        return torch.roll(V,self.k,axis=0)
     def _matvec(self,V):
-        return jnp.roll(V,self.k,axis=0)
+        return torch.roll(V,self.k,axis=0)
     def _adjoint(self):
         return LazyShift(self.shape[0],-self.k)
     def invT(self):
@@ -226,8 +226,8 @@ class Rot90(LinearOperator):
         self.k = k
         super().__init__(None,shape)
     def _matmat(self,V): #(c,k)
-        return jnp.rot90(V.reshape((self.n,self.n,-1)),self.k).reshape(V.shape)
+        return torch.rot90(V.reshape((self.n,self.n,-1)),self.k).reshape(V.shape)
     def _matvec(self,V):
-        return jnp.rot90(V.reshape((self.n,self.n,-1)),self.k).reshape(V.shape)
+        return torch.rot90(V.reshape((self.n,self.n,-1)),self.k).reshape(V.shape)
     def invT(self):
         return self

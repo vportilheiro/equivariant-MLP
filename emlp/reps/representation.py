@@ -1,7 +1,5 @@
 import numpy as np
-import jax
-import jax.numpy as jnp
-from jax import jit, device_put,vmap
+import torch
 import optax
 from sklearn.cluster import KMeans
 from tqdm.auto import tqdm
@@ -39,7 +37,7 @@ class Rep(object):
         
     def drho(self,A): 
         """ Lie Algebra representation of the matrix A of shape (d,d)"""
-        In = jnp.eye(A.shape[0])
+        In = torc.eye(A.shape[0])
         return LazyJVP(self.rho,In,A)
 
     def __call__(self,G):
@@ -99,18 +97,18 @@ class Rep(object):
         constraints = []
         constraints.extend([lazify(self.rho(h))-I(n) for h in self.G.discrete_generators])
         constraints.extend([lazify(self.drho(A)) for A in self.G.lie_algebra])
-        return ConcatLazy(constraints) if constraints else lazify(jnp.zeros((1,n)))
+        return ConcatLazy(constraints) if constraints else lazify(torch.zeros((1,n)))
 
     # TODO: is there a way to cache the results here?
     def equivariant_basis(self):  
         """ Returns the basis corresponding to the smallest k=self.rank() singular values,
             and a null_space_loss: the sum of the squares of said singular values. """
-        if self==Scalar: return jnp.ones((1,1)), 0
+        if self==Scalar: return torch.ones((1,1)), 0
         k = self.rank()
         C_lazy = self.constraint_matrix()
         C_dense = C_lazy.to_dense()
-        U, S, Vh = jnp.linalg.svd(C_dense,full_matrices=False)
-        null_space_loss = jnp.linalg.norm(S[-k:])**2
+        U, S, Vh = torch.linalg.svd(C_dense)
+        null_space_loss = torch.linalg.norm(S[-k:])**2
         Q = Vh[-k:].conj().T
         return Q, null_space_loss
     
@@ -217,9 +215,9 @@ class ScalarRep(Rep):
     def T(self):
         return self
     def rho(self,M):
-        return jnp.eye(1)
+        return torch.eye(1)
     def drho(self,M):
-        return 0*jnp.eye(1)
+        return 0*torch.eye(1)
     def __hash__(self):
         return 0
     def __eq__(self,other):
@@ -253,7 +251,7 @@ class Base(Rep):
         return self.G.d
     def __repr__(self): return str(self)#f"T{self.rank+(self.G,)}"
     def __str__(self):
-        return "V"# +(f"_{self.G}" if self.G is not None else "")
+        #return "V"# +(f"_{self.G}" if self.G is not None else "")
         return f"Vᵣ₌{chr(0x2080 + self.rank())}"
     
     def __hash__(self):
@@ -276,7 +274,7 @@ class Dual(Rep):
         return self.rep(G).T
     def rho(self,M):
         rho = self.rep.rho(M)
-        rhoinvT = rho.invT() if isinstance(rho,LinearOperator) else jnp.linalg.inv(rho).T
+        rhoinvT = rho.invT() if isinstance(rho,LinearOperator) else torch.linalg.inv(rho).T
         return rhoinvT
     def drho(self,A):
         return -self.rep.drho(A).T
@@ -329,7 +327,6 @@ def bilinear_weights(out_rep,in_rep):
     reduced_indices_dict = {rep:ids[np.random.choice(len(ids),nelems(len(ids),rep))].reshape(-1)\
                                 for rep,ids in x_rep.as_dict(np.arange(x_rep.size())).items()}
     # Apply the projections for each rank, concatenate, and permute back to orig rank order
-    @jit
     def lazy_projection(params,x): # (r,), (*c) #TODO: find out why backwards of this function is so slow
         bshape = x.shape[:-1]
         x = x.reshape(-1,x.shape[-1])
@@ -338,7 +335,7 @@ def bilinear_weights(out_rep,in_rep):
         Ws = []
         for rep, W_mult in W_multiplicities.items():
             if rep not in x_multiplicities:
-                Ws.append(jnp.zeros((bs,W_mult*rep.size())))
+                Ws.append(torch.zeros((bs,W_mult*rep.size())))
                 continue
             x_mult = x_multiplicities[rep]
             n = nelems(x_mult,rep)
@@ -349,7 +346,7 @@ def bilinear_weights(out_rep,in_rep):
             bilinear_elems = bilinear_params@x[...,bids].T.reshape(n,rep.size()*bs)
             bilinear_elems = bilinear_elems.reshape(W_mult*rep.size(),bs).T
             Ws.append(bilinear_elems)
-        Ws = jnp.concatenate(Ws,axis=-1) #concatenate over rep axis
+        Ws = torch.cat(Ws,dim=-1) #concatenate over rep axis
         return Ws[...,inv_perm].reshape(*bshape,*mat_shape) # reorder to original rank ordering
     return active_dims,lazy_projection
         
@@ -375,11 +372,11 @@ def vis(repin,repout,cluster=True):
 
 
 def scale_adjusted_rel_error(t1,t2,g):
-    error = jnp.sqrt(jnp.mean(jnp.abs(t1-t2)**2))
-    tscale = jnp.sqrt(jnp.mean(jnp.abs(t1)**2)) + jnp.sqrt(jnp.mean(jnp.abs(t2)**2))
-    gscale = jnp.sqrt(jnp.mean(jnp.abs(g-jnp.eye(g.shape[-1]))**2))
-    scale = jnp.maximum(tscale,gscale)
-    return error/jnp.maximum(scale,1e-7)
+    error = torch.sqrt(torch.mean(torch.abs(t1-t2)**2))
+    tscale = torch.sqrt(torch.mean(torch.abs(t1)**2)) + torch.sqrt(torch.mean(torch.abs(t2)**2))
+    gscale = torch.sqrt(torch.mean(torch.abs(g-torch.eye(g.shape[-1]))**2))
+    scale = torch.maximum(tscale,gscale)
+    return error/torch.maximum(scale,1e-7)
 
 @export
 def equivariance_error(W,repin,repout,G):

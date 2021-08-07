@@ -5,7 +5,6 @@ from jax import jit
 from jax.tree_util import tree_flatten, tree_unflatten
 import types
 import copy
-import jax.numpy as jnp
 import numpy as np
 import types
 from functools import partial
@@ -65,23 +64,31 @@ def torchify_fn(function):
             return to_pytorch(ctx.vjp_fn(*to_jax(grad_outputs)))
     return torched_fn.apply #TORCHED #Roasted
 
-
 @export
 class Linear(nn.Linear):
     """ Basic equivariant Linear layer from repin to repout."""
     def __init__(self, repin, repout):
         nin,nout = repin.size(),repout.size()
         super().__init__(nin,nout)
-        rep_W = repout*repin.T
-        rep_bias = repout
-        Pw = rep_W.equivariant_projector()
-        Pb = rep_bias.equivariant_projector()
-        self.proj_b = torchify_fn(jit(lambda b: Pb@b))
-        self.proj_w = torchify_fn(jit(lambda w:(Pw@w.reshape(-1)).reshape(nout,nin)))
-        logging.info(f"Linear W components:{rep_W.size()} rep:{rep_W}")
+        self.rep_W = repout*repin.T
+        self.rep_bias = repout
+        self.Pw, self.loss_w = self.rep_W.equivariant_projector()
+        self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
+        logging.info(f"Linear W components:{self.rep_W.size()} rep:{self.rep_W}")
 
     def forward(self, x): # (cin) -> (cout)
-        return F.linear(x,self.proj_w(self.weight),self.proj_b(self.bias))
+        W = (self.Pw @ self.weight.reshape(-1)).reshape(self.weight.shape)
+        b = self.Pb @ self.bias
+        return x @ W.T + b
+
+@ export
+class ProjectorRecomputingLinear(Linear):
+    """ Clone of equivariant Linear layer which updates the equivariant projector
+        on each call. """
+    def __call__(self, x):
+        self.Pw, self.loss_w = self.rep_W.equivariant_projector()
+        self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
+        return super().__call__(x)
 
 @export
 class BiLinear(nn.Module):
@@ -90,7 +97,7 @@ class BiLinear(nn.Module):
     def __init__(self, repin, repout):
         super().__init__()
         Wdim, weight_proj = bilinear_weights(repout,repin)
-        self.weight_proj = torchify_fn(jit(weight_proj))
+        self.weight_proj = weight_proj
         self.bi_params = nn.Parameter(torch.randn(Wdim))
         logging.info(f"BiW components: dim:{Wdim}")
 
@@ -117,13 +124,12 @@ class GatedNonlinearity(nn.Module): #TODO: add support for mixed tensors and non
 class EMLPBlock(nn.Module):
     """ Basic building block of EMLP consisting of G-Linear, biLinear,
         and gated nonlinearity. """
-    def __init__(self,rep_in,rep_out):
+    def __init__(self,rep_in,rep_out, LinearClass=Linear):
         super().__init__()
-        self.linear = Linear(rep_in,gated(rep_out))
+        self.linear = LinearClass(rep_in,gated(rep_out))
         self.bilinear = BiLinear(gated(rep_out),gated(rep_out))
         self.nonlinearity = GatedNonlinearity(rep_out)
-
-    def forward(self,x):
+    def __call__(self,x):
         lin = self.linear(x)
         preact =self.bilinear(lin)+lin
         return self.nonlinearity(preact)
@@ -165,6 +171,55 @@ class EMLP(nn.Module):
         )
     def forward(self,x):
         return self.network(x)
+
+@export
+class LearnedGroupEMLP(nn.Module):
+    """ EMLP with "learned equivariance." Same args as EMLP, but rep_in and rep_out
+        must be of class FixedRankRep, and ranks of inner representations must be 
+        be specified as well. """
+    
+    def __init__(self, rep_in, rep_out, group, middle_rep_rank=2, ch=10, num_layers=3):
+        super().__init__()
+        assert type(middle_rep_rank) == type(ch)
+        if type(middle_rep_rank) is list:
+            assert len(middle_rep_rank) == len(ch) == num_layers
+        logging.info("Initing LearnedGroupEMLP (objax)")
+        self.rep_in = rep_in(group)
+        self.rep_out = rep_out(group)
+        self.middle_rep_rank = middle_rep_rank
+        
+        self.G=group
+
+        # Parse ch as a single int, a sequence of ints, a single Rep, a sequence of Reps
+        if isinstance(ch,int):
+            tensor_constructor = lambda p,q=0,G=None: T(middle_rep_rank,p,q,G)
+            middle_layers = num_layers*[uniform_rep(ch,group,tensor_constructor)]
+        elif isinstance(ch,FixedRankRep):
+            middle_layers = num_layers*[ch(group)]
+        else: 
+            tensor_constructors = ((lambda p,q=0,G=None: T(rank,p,q,G)) for rank in middle_rep_rank)
+            middle_layers = [(c(group) if isinstance(c,FixedRankRep) \
+                             else uniform_rep(c,group,T)) for c,T in zip(ch, tensor_constructors)]
+        #assert all((not rep.G is None) for rep in middle_layers[0].reps)
+        reps = [self.rep_in]+middle_layers
+        logging.info(f"Reps: {reps}")
+        self.network = nn.Sequential(
+            *[EMLPBlock(rin,rout,LinearClass=ProjectorRecomputingLinear) for rin,rout in zip(reps,reps[1:])],
+            ProjectorRecomputingLinear(reps[-1],self.rep_out)
+        )
+
+    def __call__(self,x,training=True):
+        return self.network(x)
+
+    def null_space_loss(self):
+        """ Returns the sum of null_space_loss terms for each linear map representation.
+            Note this means that the same representation's loss can count multiple times,
+            across different EMLPBlocks. """
+        result = 0
+        for block in self.network[:-1]:
+            result += block.linear.loss_w + block.linear.loss_b
+        result += self.network[-1].loss_w + self.network[-1].loss_b
+        return result
 
 class Swish(nn.Module):
     def forward(self,x):

@@ -2,20 +2,20 @@ import emlp
 from emlp.learned_group import LearnedGroup
 from emlp.groups import S
 from emlp.reps import V, equivariance_error
+import emlp.nn.pytorch as nn
 
-import objax
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from tqdm.auto import tqdm
 
 alpha = 0.8 # regularization parameter: how much to weight null space loss vs model loss
-lr = 5e-5
-epochs = 50000#250000
+lr = 8e-4
+epochs = 10000 
 batch_size = 64
 
 n=3
-W = 3*np.eye(n) + 2*np.ones((n,n))
+W = 3*torch.eye(n) + 2*torch.ones((n,n))
 
 num_layers = 1
 
@@ -23,36 +23,28 @@ def main():
 
     G = S(n)
     Ghat = LearnedGroup(n,ncontinuous=0,ndiscrete=n-1)
-    repin = V(2)
+    repin = V(1)
     repout = V(1)
-    model = emlp.nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=2)
+    model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=2)
 
-    opt = objax.optimizer.Adam(model.vars())
-
-    @objax.Jit
-    @objax.Function.with_vars(model.vars())
-    def loss(x,y,alpha=alpha):
-        model_loss = ((model(x) - y)**2).mean()
-        null_space_loss = model.null_space_loss()
-        return (1-alpha)*model_loss + alpha*null_space_loss, model_loss, null_space_loss
-
-    grad_and_val = objax.GradValues(loss, model.vars())
-
-    @objax.Jit
-    @objax.Function.with_vars(model.vars()+opt.vars())
-    def train_op(x, y, lr):
-        g, v = grad_and_val(x, y)
-        opt(lr=lr, grads=g)
-        return v
+    opt = torch.optim.Adam(model.parameters(),lr=lr)
 
     model_losses = []
     null_space_losses = []
     equivariance_errors_learned = []
     equivariance_errors_true = []
     for epoch in tqdm(range(epochs)):
-        x = np.random.rand(batch_size, n).squeeze()
+        opt.zero_grad()
+        x = torch.normal(0,1,size=(batch_size, n)).squeeze()
         y = (W @ x[..., np.newaxis]).squeeze()
-        total_loss, model_loss, null_space_loss = train_op(jnp.array(x),jnp.array(y),lr)
+        yhat = model(x)
+
+        model_loss = ((model(x) - y)**2).mean()
+        null_space_loss = model.null_space_loss()
+        loss = (1-alpha)*model_loss + alpha*null_space_loss
+        loss.backward()
+        opt.step()
+
         model_losses.append(model_loss)
         null_space_losses.append(null_space_loss)
 
@@ -61,7 +53,8 @@ def main():
         #equivariance_errors_learned.append(equivariance_error(linear.w, linear.repin(Ghat), linear.repout(Ghat), Ghat))
         #equivariance_errors_true.append(equivariance_error(linear.w, linear.repin(G), linear.repout(G), G))
 
-    fig, ((ax_model_loss, ax_null_loss), (ax_learned, ax_true)) = plt.subplots(2,2)
+    #fig, ((ax_model_loss, ax_null_loss), (ax_learned, ax_true)) = plt.subplots(2,2)
+    fig, (ax_model_loss, ax_null_loss) = plt.subplots(1,2)
     
     ax_model_loss.plot(np.arange(epochs), model_losses)
     ax_model_loss.set_title("Model loss")
@@ -80,14 +73,20 @@ def main():
     for l in range(num_layers+1):
         print(f"===== Layer {l} =====")
         linear = model.network[l].linear if l < num_layers else model.network[l]
+        print(f"rep W: {linear.rep_W}")
+
         Q, loss = (linear.rep_W).equivariant_basis()
-        print(f"Q = {Q.to_dense()}")
+        print(f"Q = {Q.to_dense().detach().numpy()}")
 
         Proj, _ = (linear.rep_W).equivariant_projector()
-        print(f"Proj = {Proj.to_dense()}")
+        print(f"Proj = {Proj.to_dense().detach().numpy()}")
 
-        print(f"loss = {loss}")
+        print(f"null space loss = {loss}")
+
+        print(f"Projected weight = {(linear.Pw @ linear.weight.reshape(-1)).reshape(linear.weight.shape).detach().numpy()}")
+
         print()
+
 
     print(f"Ghat generators: {Ghat.discrete_generators}")
 
