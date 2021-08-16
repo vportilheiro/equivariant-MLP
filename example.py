@@ -94,7 +94,7 @@ def main():
         print()
 
 
-    print(f"Ghat generators: {Ghat.discrete_generators}")
+    print(f"Ghat generators: {Ghat.discrete_generators.detach().numpy()}")
 
 if __name__ == "__main__":
     main()

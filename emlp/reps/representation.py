@@ -108,7 +108,7 @@ class Rep(object):
         C_lazy = self.constraint_matrix()
         C_dense = C_lazy.to_dense()
         U, S, Vh = torch.linalg.svd(C_dense)
-        null_space_loss = torch.linalg.norm(S[-k:])**2
+        null_space_loss = torch.linalg.norm(S[-k:])**2 #torch.sum(S[-k:])
         Q = Vh[-k:].conj().T
         return Q, null_space_loss
     
