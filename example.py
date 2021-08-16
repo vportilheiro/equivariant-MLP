@@ -16,8 +16,8 @@ import objax
 import jax.numpy as jnp
 from tqdm.auto import tqdm
 
-alpha = 0.5 # regularization parameter: how much to weight equivariance loss 
-beta = 0 # regularization parameter: how much to weight generator loss
+alpha = 0.9 # regularization parameter: how much to weight equivariance loss 
+beta = 0.0  # regularization parameter: how much to weight generator loss
 lr = 8e-4
 epochs = 20000 
 batch_size = 64
@@ -28,7 +28,7 @@ ord=2
 n=3
 W = 3*jnp.eye(n) + 2*jnp.ones((n,n))
 
-num_layers = 1
+num_layers = 3
 channels = 10
 
 def main():
@@ -76,7 +76,8 @@ def main():
     equivariance_errors_true = []
     for epoch in tqdm(range(epochs)):
         x = objax.random.normal((batch_size, n)).squeeze()
-        y = (W @ x[..., jnp.newaxis]).squeeze()
+        x_max = x.max(axis=-1)
+        y = (W @ x[..., jnp.newaxis]).squeeze() + x_max[:, jnp.newaxis]
         _, model_loss, equivariance_loss, generator_loss = train_op(x, y, lr)
 
         model_losses.append(model_loss)

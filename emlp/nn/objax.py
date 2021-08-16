@@ -65,11 +65,14 @@ class ApproximatingLinear(nn.Linear):
         repin = self.repin(G)
         repout = self.repout(G)
         W = self.w.value
+        b = self.b.value
         loss = 0
         for h in G.discrete_generators:
             loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
+            loss += jnp.linalg.norm(repout.rho_dense(h) @ b - b, ord=ord)
         for A in G.lie_algebra:
             loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
+            # TODO: deal with bias term?
         return loss
 
     def generator_loss(self, G, ord=2):
