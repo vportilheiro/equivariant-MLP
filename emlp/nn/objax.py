@@ -48,6 +48,45 @@ class Linear(nn.Linear):
         return out
 
 @export
+class ApproximatingLinear(nn.Linear):
+    """ A vanilla linear layer from repin to repout which knows how to calculate
+        an "approximate equivariance loss". """
+    def __init__(self, repin, repout):
+        self.repin, self.repout = repin, repout
+        nin,nout = repin.size(),repout.size()
+        super().__init__(nin,nout)
+        self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+        self.w = TrainVar(orthogonal((nout, nin)))
+
+    def __call__(self, x):
+        return x @ self.w.value.T + self.b.value
+
+    def equivariance_loss(self, G, ord=2):
+        repin = self.repin(G)
+        repout = self.repout(G)
+        W = self.w.value
+        loss = 0
+        for h in G.discrete_generators:
+            loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
+        for A in G.lie_algebra:
+            loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
+        return loss
+
+    def generator_loss(self, G, ord=2):
+        repin = self.repin(G)
+        repout = self.repout(G)
+        W = self.w.value
+        loss = 0
+        for h in G.discrete_generators:
+            loss += jnp.linalg.norm(repin.rho_dense(h), ord=ord)
+            loss += jnp.linalg.norm(repout.rho_dense(h), ord=ord)
+        for A in G.lie_algebra:
+            loss += jnp.linalg.norm(repin.drho_dense(A), ord=ord)
+            loss += jnp.linalg.norm(repout.drho_dense(A), ord=ord)
+        return loss
+
+
+@export
 class BiLinear(Module):
     """ Cheap bilinear layer (adds parameters for each part of the input which can be
         interpreted as a linear map from a part of the input to the output representation)."""
@@ -88,9 +127,9 @@ class GatedNonlinearity(Module): #TODO: add support for mixed tensors and non su
 class EMLPBlock(Module):
     """ Basic building block of EMLP consisting of G-Linear, biLinear,
         and gated nonlinearity. """
-    def __init__(self,rep_in,rep_out):
+    def __init__(self,rep_in,rep_out,LinearLayer=Linear):
         super().__init__()
-        self.linear = Linear(rep_in,gated(rep_out))
+        self.linear = LinearLayer(rep_in,gated(rep_out))
         self.bilinear = BiLinear(gated(rep_out),gated(rep_out))
         self.nonlinearity = GatedNonlinearity(rep_out)
     def __call__(self,x):
@@ -175,7 +214,7 @@ class EMLP(Module,metaclass=Named):
 
         Returns:
             Module: the EMLP objax module."""
-    def __init__(self,rep_in,rep_out,group,ch=384,num_layers=3):#@
+    def __init__(self,rep_in,rep_out,group,ch=384,num_layers=3,LinearLayer=Linear):#@
         super().__init__()
         logging.info("Initing EMLP (objax)")
         self.rep_in =rep_in(group)
@@ -190,8 +229,8 @@ class EMLP(Module,metaclass=Named):
         reps = [self.rep_in]+middle_layers
         logging.info(f"Reps: {reps}")
         self.network = Sequential(
-            *[EMLPBlock(rin,rout) for rin,rout in zip(reps,reps[1:])],
-            Linear(reps[-1],self.rep_out)
+            *[EMLPBlock(rin,rout,LinearLayer) for rin,rout in zip(reps,reps[1:])],
+            LinearLayer(reps[-1],self.rep_out)
         )
     def __call__(self,x,training=True):
         return self.network(x)
