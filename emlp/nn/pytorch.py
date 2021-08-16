@@ -68,6 +68,7 @@ def torchify_fn(function):
 class Linear(nn.Linear):
     """ Basic equivariant Linear layer from repin to repout."""
     def __init__(self, repin, repout):
+        self.repin, self.repout = repin, repout
         nin,nout = repin.size(),repout.size()
         super().__init__(nin,nout)
         self.rep_W = repout*repin.T
@@ -81,7 +82,7 @@ class Linear(nn.Linear):
         b = self.Pb @ self.bias
         return x @ W.T + b
 
-@ export
+@export
 class ProjectorRecomputingLinear(Linear):
     """ Clone of equivariant Linear layer which updates the equivariant projector
         on each call. """
@@ -89,6 +90,31 @@ class ProjectorRecomputingLinear(Linear):
         self.Pw, self.loss_w = self.rep_W.equivariant_projector()
         self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
         return super().__call__(x)
+
+    def equivariance_loss(self, G, ord=2):
+        repin = self.repin(G)
+        repout = self.repout(G)
+        #W = (self.Pw @ self.weight.reshape(-1)).reshape(self.weight.shape)
+        W = self.weight
+        loss = 0
+        for h in G.discrete_generators:
+            loss += torch.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
+        for A in G.lie_algebra:
+            loss += torch.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
+        return loss
+
+    def generator_loss(self, G, ord=2):
+        repin = self.repin(G)
+        repout = self.repout(G)
+        loss = 0
+        for h in G.discrete_generators:
+            loss += torch.linalg.norm(repin.rho_dense(h), ord=ord)
+            loss += torch.linalg.norm(repout.rho_dense(h), ord=ord)
+        for A in G.lie_algebra:
+            loss += torch.linalg.norm(repin.drho_dense(A), ord=ord)
+            loss += torch.linalg.norm(repout.drho_dense(A), ord=ord)
+        return loss
+
 
 @export
 class BiLinear(nn.Module):
@@ -219,6 +245,26 @@ class LearnedGroupEMLP(nn.Module):
         for block in self.network[:-1]:
             result += block.linear.loss_w + block.linear.loss_b
         result += self.network[-1].loss_w + self.network[-1].loss_b
+        return result
+
+    def equivariance_loss(self, G, ord=2):
+        """ Returns the sum of equivariance_loss terms for each linear map representation.
+            Note this means that the same representation's loss can count multiple times,
+            across different EMLPBlocks. """
+        result = 0
+        for block in self.network[:-1]:
+            result += block.linear.equivariance_loss(G, ord)
+        result += self.network[-1].equivariance_loss(G, ord)
+        return result
+
+    def generator_loss(self, G, ord=2):
+        """ Returns the sum of null_space_loss terms for each linear map representation.
+            Note this means that the same representation's loss can count multiple times,
+            across different EMLPBlocks. """
+        result = 0
+        for block in self.network[:-1]:
+            result += block.linear.generator_loss(G, ord)
+        result += self.network[-1].generator_loss(G, ord)
         return result
 
 class Swish(nn.Module):

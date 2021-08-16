@@ -103,8 +103,8 @@ class LazyKronsum(LinearOperator):
 class LazyJVP(LinearOperator):
     def __init__(self,operator_fn,X,TX):
         self.shape = operator_fn(X).shape
-        self.vjp = lambda v: jax.jvp(lambda x: operator_fn(x)@v,[X],[TX])[1]
-        self.vjp_T = lambda v: jax.jvp(lambda x: operator_fn(x).T@v,[X],[TX])[1]
+        self.vjp = lambda v: torch.autograd.functional.jvp(lambda x: operator_fn(x)@v,(X,),(TX,))[1]
+        self.vjp_T = lambda v: torch.autograd.functional.jvp(lambda x: operator_fn(x).T@v,(X,),(TX,))[1]
         self.dtype=torch.float32
     def _matmat(self,v):
         return self.vjp(v)
@@ -135,7 +135,8 @@ class ConcatLazy(LinearOperator):
     
 class LazyDirectSum(LinearOperator):
     def __init__(self,Ms,multiplicities=None):
-        self.Ms = [jax.device_put(M.astype(np.float32)) if isinstance(M,(np.ndarray)) else M for M in Ms]
+        #self.Ms = [jax.device_put(M.astype(np.float32)) if isinstance(M,(np.ndarray)) else M for M in Ms]
+        self.Ms = Ms
         self.multiplicities = [1 for M in Ms] if multiplicities is None else multiplicities
         shape = (sum(Mi.shape[0]*c for Mi,c in zip(Ms,multiplicities)),
                       sum(Mi.shape[0]*c for Mi,c in zip(Ms,multiplicities)))
@@ -155,7 +156,7 @@ class LazyDirectSum(LinearOperator):
     def to_dense(self):
         Ms_all = [M for M,c in zip(self.Ms,self.multiplicities) for _ in range(c)]
         Ms_all = [Mi.to_dense() if isinstance(Mi,LinearOperator) else Mi for Mi in Ms_all]
-        return jax.scipy.linalg.block_diag(*Ms_all)
+        return torch.block_diag(*Ms_all)
     # def __new__(cls,Ms,multiplicities=None):
     #     if len(Ms)==1 and multiplicities is None: return Ms[0]
     #     return super().__new__(cls)
@@ -210,7 +211,8 @@ class SwapMatrix(LinearOperator):
         shape = (n,n)
         super().__init__(None,shape)
     def _matmat(self,V): #(c,k)
-        V = jax.ops.index_update(V, jax.ops.index[self.swaprows], V[self.swaprows[::-1]])
+        #V = jax.ops.index_update(V, jax.ops.index[self.swaprows], V[self.swaprows[::-1]])
+        V[self.swaprows] = V[self.swaprows[::-1]]
         return V
     def _matvec(self,V):
         return self._matmat(V)
