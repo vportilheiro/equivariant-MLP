@@ -15,9 +15,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-alpha = 0.5 # regularization parameter: how much to weight equivariance loss
-beta = 0.0  # regularization parameter: how much to weight generator loss
-gamma = 0.0 # regularization parameter: how much to weight null space loss
+alpha = 0.1 # regularization parameter: how much to weight equivariance loss
+beta = 1e-8  # regularization parameter: how much to weight generator loss
+gamma = 0.7 # regularization parameter: how much to weight null space loss
 lr = 8e-4
 epochs = 20000 
 batch_size = 64
@@ -33,8 +33,8 @@ def main():
 
     G = S(n)
     Ghat = LearnedGroup(n,ncontinuous=0,ndiscrete=n-1)
-    repin = V(1)
-    repout = V(1)
+    repin = V(3)
+    repout = V(3)
     model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=channels)
 
     opt = torch.optim.Adam(model.parameters(),lr=lr)

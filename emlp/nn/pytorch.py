@@ -94,8 +94,8 @@ class ProjectorRecomputingLinear(Linear):
     def equivariance_loss(self, G, ord=2):
         repin = self.repin(G)
         repout = self.repout(G)
-        #W = (self.Pw @ self.weight.reshape(-1)).reshape(self.weight.shape)
-        W = self.weight
+        W = (self.Pw @ self.weight.reshape(-1)).reshape(self.weight.shape)
+        #W = self.weight
         loss = 0
         for h in G.discrete_generators:
             loss += torch.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
