@@ -6,7 +6,7 @@
 
 import emlp
 from emlp.learned_group import LearnedGroup
-from emlp.groups import S
+from emlp.groups import S,SO
 from emlp.reps import V, equivariance_error
 import emlp.nn.pytorch as nn
 
@@ -22,17 +22,18 @@ lr = 8e-4
 epochs = 20000 
 batch_size = 64
 
-n=3
-channels=2
+n=2
+channels=5
 
-W = 3*torch.eye(n) + 2*torch.ones((n,n))
+#W = 3*torch.eye(n) + 2*torch.ones((n,n))
+W = torch.Tensor([[0.0,-1.0],[1.0,0.0]])
 
 num_layers = 1
 
 def main():
 
-    G = S(n)
-    Ghat = LearnedGroup(n,ncontinuous=0,ndiscrete=n-1)
+    G = SO(n)
+    Ghat = LearnedGroup(n,ncontinuous=n*(n-1)//2,ndiscrete=0)
     repin = V(1)
     repout = V(1)
     model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=channels)
