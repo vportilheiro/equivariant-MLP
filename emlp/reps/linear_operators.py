@@ -61,6 +61,8 @@ class LazyKron(LinearOperator):
 
 #@jit
 def kronsum(A,B):
+    A = A.contiguous()
+    B = B.contiguous()
     return torch.kron(A,torch.eye(B.shape[-1])) + torch.kron(torch.eye(A.shape[-1]),B)
 
 
