@@ -67,29 +67,21 @@ def torchify_fn(function):
 @export
 class Linear(nn.Linear):
     """ Basic equivariant Linear layer from repin to repout."""
-    def __init__(self, repin, repout):
+    def __init__(self, repin, repout, W_rank=None, b_rank=None):
         self.repin, self.repout = repin, repout
+        self.W_rank, self.b_rank = W_rank, b_rank
         nin,nout = repin.size(),repout.size()
         super().__init__(nin,nout)
-        self.rep_W = repout*repin.T
+        self.rep_W = (repin >> repout)
         self.rep_bias = repout
-        self.Pw, self.loss_w = self.rep_W.equivariant_projector()
-        self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
+        self.Pw, self.loss_w = self.rep_W.equivariant_projector(k=W_rank)
+        self.Pb, self.loss_b = self.rep_bias.equivariant_projector(k=b_rank)
         logging.info(f"Linear W components:{self.rep_W.size()} rep:{self.rep_W}")
 
     def forward(self, x): # (cin) -> (cout)
         W = (self.Pw @ self.weight.reshape(-1)).reshape(self.weight.shape)
         b = self.Pb @ self.bias
         return x @ W.T + b
-
-@export
-class ProjectorRecomputingLinear(Linear):
-    """ Clone of equivariant Linear layer which updates the equivariant projector
-        on each call. """
-    def __call__(self, x):
-        self.Pw, self.loss_w = self.rep_W.equivariant_projector()
-        self.Pb, self.loss_b = self.rep_bias.equivariant_projector()
-        return super().__call__(x)
 
     def equivariance_loss(self, G, ord=2):
         repin = self.repin(G)
@@ -108,7 +100,9 @@ class ProjectorRecomputingLinear(Linear):
             loss += diff @ diff
         for A in G.lie_algebra:
             loss += torch.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
-            # TODO: deal with bias term?
+
+            diff = (repout.drho_dense(A) @ b - b)
+            loss += diff @ diff
         return loss
 
     def generator_loss(self, G, ord=2):
@@ -124,6 +118,16 @@ class ProjectorRecomputingLinear(Linear):
         return loss
 
 
+@export
+class ProjectorRecomputingLinear(Linear):
+    """ Clone of equivariant Linear layer which updates the equivariant projector
+        on each call. """
+    def __call__(self, x):
+        self.Pw, self.loss_w = self.rep_W.equivariant_projector(k=self.W_rank)
+        self.Pb, self.loss_b = self.rep_bias.equivariant_projector(k=self.b_rank)
+        return super().__call__(x)
+
+    
 @export
 class BiLinear(nn.Module):
     """ Cheap bilinear layer (adds parameters for each part of the input which can be
@@ -158,9 +162,9 @@ class GatedNonlinearity(nn.Module): #TODO: add support for mixed tensors and non
 class EMLPBlock(nn.Module):
     """ Basic building block of EMLP consisting of G-Linear, biLinear,
         and gated nonlinearity. """
-    def __init__(self,rep_in,rep_out, LinearClass=Linear):
+    def __init__(self,rep_in,rep_out, W_rank=None, b_rank=None, LinearClass=Linear):
         super().__init__()
-        self.linear = LinearClass(rep_in,gated(rep_out))
+        self.linear = LinearClass(rep_in,gated(rep_out), W_rank, b_rank)
         self.bilinear = BiLinear(gated(rep_out),gated(rep_out))
         self.nonlinearity = GatedNonlinearity(rep_out)
     def __call__(self,x):
@@ -208,38 +212,28 @@ class EMLP(nn.Module):
 
 @export
 class LearnedGroupEMLP(nn.Module):
-    """ EMLP with "learned equivariance." Same args as EMLP, but rep_in and rep_out
-        must be of class FixedRankRep, and ranks of inner representations must be 
-        be specified as well. """
+    """ EMLP with "learned equivariance." Same args as EMLP. """
     
-    def __init__(self, rep_in, rep_out, group, middle_rep_rank=2, ch=10, num_layers=3):
+    def __init__(self, rep_in, rep_out, group, W_ranks, b_ranks, ch=10, num_layers=3):
         super().__init__()
-        assert type(middle_rep_rank) == type(ch)
-        if type(middle_rep_rank) is list:
-            assert len(middle_rep_rank) == len(ch) == num_layers
+        assert len(W_ranks) == len(b_ranks) == len(ch) == num_layers
         logging.info("Initing LearnedGroupEMLP (objax)")
         self.rep_in = rep_in(group)
         self.rep_out = rep_out(group)
-        self.middle_rep_rank = middle_rep_rank
         
         self.G=group
 
         # Parse ch as a single int, a sequence of ints, a single Rep, a sequence of Reps
-        if isinstance(ch,int):
-            tensor_constructor = lambda p,q=0,G=None: T(middle_rep_rank,p,q,G)
-            middle_layers = num_layers*[uniform_rep(ch,group,tensor_constructor)]
-        elif isinstance(ch,FixedRankRep):
-            middle_layers = num_layers*[ch(group)]
-        else: 
-            tensor_constructors = ((lambda p,q=0,G=None: T(rank,p,q,G)) for rank in middle_rep_rank)
-            middle_layers = [(c(group) if isinstance(c,FixedRankRep) \
-                             else uniform_rep(c,group,T)) for c,T in zip(ch, tensor_constructors)]
+        if isinstance(ch,int): middle_layers = num_layers*[uniform_rep(ch,group)]#[uniform_rep(ch,group) for _ in range(num_layers)]
+        elif isinstance(ch,Rep): middle_layers = num_layers*[ch(group)]
+        else: middle_layers = [(c(group) if isinstance(c,Rep) else uniform_rep(c,group)) for c in ch]
         #assert all((not rep.G is None) for rep in middle_layers[0].reps)
         reps = [self.rep_in]+middle_layers
         logging.info(f"Reps: {reps}")
         self.network = nn.Sequential(
-            *[EMLPBlock(rin,rout,LinearClass=ProjectorRecomputingLinear) for rin,rout in zip(reps,reps[1:])],
-            ProjectorRecomputingLinear(reps[-1],self.rep_out)
+            *[EMLPBlock(rin,rout,W_rank,b_rank,LinearClass=ProjectorRecomputingLinear)
+                    for rin,rout,W_rank,b_rank in zip(reps,reps[1:],W_ranks,b_ranks)],
+            ProjectorRecomputingLinear(reps[-1],self.rep_out,W_ranks[-1],b_ranks[-1])
         )
 
     def __call__(self,x,training=True):

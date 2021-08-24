@@ -4,8 +4,9 @@ from scipy.linalg import expm
 from oil.utils.utils import Named,export
 import jax
 import jax.numpy as jnp
-from emlp.reps.linear_operators import LazyShift,SwapMatrix,Rot90,LazyKron,LazyKronsum,LazyPerm,I
+from emlp.reps.linear_operators import densify,LazyShift,SwapMatrix,Rot90,LazyKron,LazyKronsum,LazyPerm,I
 from jax import jit,vmap
+import torch
 
 def rel_err(A,B):
     return jnp.mean(jnp.abs(A-B))/(jnp.mean(jnp.abs(A)) + jnp.mean(jnp.abs(B))+1e-6)
@@ -101,6 +102,11 @@ class Group(object,metaclass=Named):
 
     def __mul__(self,other):
         return DirectProduct(self,other)
+
+    def torchify(self):
+        self.discrete_generators = [torch.Tensor(densify(M).copy()) for M in self.discrete_generators]
+        self.lie_algebra = [torch.Tensor(densify(A).copy()) for A in self.lie_algebra]
+        return self
 
 @jit
 def matrix_power_simple(M,n):

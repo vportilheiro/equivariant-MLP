@@ -9,11 +9,12 @@ from collections import defaultdict
 from plum import dispatch
 
 class SumRep(Rep):
-    def __init__(self,*reps,extra_perm=None):#repcounter,repperm=None):
+    def __init__(self,*reps,G,extra_perm=None):#repcounter,repperm=None):
         """ Constructs a tensor type based on a list of tensor ranks
             and possibly the symmetry generators gen."""
+        self.G=G
         # Integers can be used as shorthand for scalars.
-        reps = [SumRepFromCollection({Scalar:rep}) if isinstance(rep,int) else rep for rep in reps]
+        reps = [SumRepFromCollection({Scalar:rep}, G=G) if isinstance(rep,int) else rep for rep in reps]
         # Get reps and permutations
         reps,perms = zip(*[rep.canonicalize() for rep in reps])
         rep_counters = [rep.reps if isinstance(rep,SumRep) else {rep:1} for rep in reps]
@@ -27,9 +28,6 @@ class SumRep(Rep):
 
     def size(self):
         return sum(rep.size()*count for rep,count in self.reps.items())
-
-    def rank(self):
-        return sum(rep.rank()*count for rep,count in self.reps.items())
 
     def rho(self,M):
         rhos = [rep.rho(M) for rep in self.reps]
@@ -51,7 +49,7 @@ class SumRep(Rep):
     @property
     def T(self):
         """ only swaps to adjoint representation, does not reorder elems"""
-        return SumRep(*[rep.T for rep,c in self.reps.items() for _ in range(c)],extra_perm=self.perm)
+        return SumRep(*[rep.T for rep,c in self.reps.items() for _ in range(c)],G=self.G,extra_perm=self.perm)
         # not necessarily still canonical ordered
         #return SumRepFromCollection({rep.T:c for rep,c in self.reps.items()},self.perm)
 
@@ -64,53 +62,16 @@ class SumRep(Rep):
     def canonicalize(self):
         """Returns a canonically ordered rep with order np.arange(self.size()) and the
             permutation which achieves that ordering"""
-        return SumRepFromCollection(self.reps),self.perm
+        return SumRepFromCollection(self.reps,G=self.G),self.perm
 
     def __call__(self,G):
-        return SumRepFromCollection({rep.T:c for rep,c in self.reps.items()},perm=self.perm)
+        self.G = G
+        return self
+        #return SumRepFromCollection({rep.T:c for rep,c in self.reps.items()},perm=self.perm)
 
     @property
     def concrete(self):
         return True
-
-    def equivariant_basis(self):
-        """ Overrides default implementation with a more efficient version which decomposes the constraints
-            across the sum."""
-        Qs = {}
-        losses = {}
-        for rep in self.reps:
-            Qs[rep], losses[rep] = rep.equivariant_basis()
-        active_dims = sum([self.reps[rep]*Qs[rep].shape[-1] for rep in Qs.keys()])
-        multiplicities = self.reps.values()
-        def lazy_Q(array):
-            return lazy_direct_matmat(array,Qs.values(),multiplicities)[self.invperm]
-        loss = sum(losses[rep] * count for rep,count in self.reps.items())
-        return LinearOperator(shape=(self.size(),active_dims),matvec=lazy_Q,matmat=lazy_Q), loss
-
-    def equivariant_projector(self):
-        """ Overrides default implementation with a more efficient version which decomposes the constraints
-            across the sum."""
-        Ps = {}
-        losses = {}
-        for rep in self.reps:
-            Ps[rep], losses[rep] = rep.equivariant_projector()
-        multiplicities = self.reps.values()
-        def lazy_P(array):
-            return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
-        loss = sum(losses[rep] * count for rep,count in self.reps.items())
-        return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P), loss
-
-    # ##TODO: investigate why these more idiomatic definitions with Lazy Operators end up slower
-    # def equivariant_basis(self):
-    #     Qs = [rep.equivariant_basis() for rep in self.reps]
-    #     Qs = [(jax.device_put(Q.astype(np.float32)) if isinstance(Q,(np.ndarray)) else Q) for Q in Qs]
-    #     multiplicities  = self.reps.values()
-    #     return LazyPerm(self.invperm)@LazyDirectSum(Qs,multiplicities)
-    # def equivariant_projector(self):
-    #     Ps = [rep.equivariant_projector() for rep in self.reps]
-    #     Ps = (jax.device_put(P.astype(np.float32)) if isinstance(P,(np.ndarray)) else P)
-    #     multiplicities  = self.reps.values()
-    #     return LazyPerm(self.invperm)@LazyDirectSum(Ps,multiplicities)@LazyPerm(self.perm)
 
     # Some additional SumRep specific methods to be used for internal purposes
     @staticmethod
@@ -173,8 +134,9 @@ def mul_reps(ra,rb):  # base case
     
 #TODO: consolidate with the __init__ method of the basic SumRep
 class SumRepFromCollection(SumRep): # a different constructor for SumRep
-    def __init__(self,counter,perm=None):
+    def __init__(self,counter,G,perm=None):
         self.reps = counter
+        self.G = G
         self.perm = np.arange(self.size()) if perm is None else perm
         self.reps,self.perm = self.compute_canonical([counter],[self.perm])
         self.invperm = np.argsort(self.perm)
@@ -188,7 +150,9 @@ def distribute_product(reps,extra_perm=None):
         takes in a sequence of reps=[ρ₁,ρ₂,ρ₃,...] which are to be multiplied together and at
         least one of the reps is a SumRep, and distributes out the terms."""
     reps,perms =zip(*[repsum.canonicalize() for repsum in reps])
-    reps = [rep if isinstance(rep,SumRep) else SumRepFromCollection({rep:1}) for rep in reps]
+    assert all(rep.G == reps[0].G for rep in reps)
+    G = reps[0].G
+    reps = [rep if isinstance(rep,SumRep) else SumRepFromCollection({rep:1},G=G) for rep in reps]
     # compute axis_wise perm to canonical vector ordering along each axis
     
     axis_sizes = [len(perm) for perm in perms]
@@ -230,7 +194,7 @@ def distribute_product(reps,extra_perm=None):
     total_perm = order[block_perm[each_perm]]
     if extra_perm is not None: total_perm = extra_perm[total_perm]
     #TODO: could achieve additional reduction by canonicalizing at this step, but unnecessary for now
-    return SumRep(*ordered_reps,extra_perm=total_perm)
+    return SumRep(*ordered_reps,extra_perm=total_perm,G=G)
 
 
 @cache(maxsize=None)
@@ -274,9 +238,6 @@ class ProductRep(Rep):
     def size(self):
         return product([rep.size()**count for rep,count in self.reps.items()])
     
-    def rank(self):
-        return product([rep.rank()**count for rep,count in self.reps.items()])
-
     def rho(self,Ms,lazy=False):
         if hasattr(self,'G') and isinstance(Ms,dict): Ms=Ms[self.G]
         canonical_lazy = LazyKron([rep.rho(Ms) for rep,c in self.reps.items() for _ in range(c)])
@@ -382,26 +343,6 @@ class DirectProduct(ProductRep):
         self.is_permutation = all(rep.is_permutation for rep in self.reps.keys())
         assert all(count==1 for count in self.reps.values())
 
-    def equivariant_basis(self):
-        Qs = []
-        losses = {}
-        for rep in self.reps:
-            Q, losses[rep] = rep.equivariant_basis() 
-            Qs.append(Q)
-        canon_Q = LazyKron(Qs)
-        loss = reduce(lambda x,y: x*y, (losses[rep]**count for rep,count in self.reps.items()))
-        return LazyPerm(self.invperm)@canon_Q, loss
-
-    def equivariant_projector(self):
-        Ps = []
-        losses = {}
-        for rep in self.reps:
-            P, losses[rep] = rep.equivariant_projector()
-            Ps.append(P)
-        canon_P = LazyKron(Ps)
-        loss = reduce(lambda x,y: x*y, (losses[rep]**count for rep,count in self.reps.items()))
-        return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm), loss
-
     def rho(self,Ms):
         canonical_lazy = LazyKron([rep.rho(Ms) for rep,c in self.reps.items() for _ in range(c)])
         return LazyPerm(self.invperm)@canonical_lazy@LazyPerm(self.perm)
@@ -424,7 +365,7 @@ class DeferredSumRep(Rep):
        
     def __call__(self,G):
         if G is None: return self
-        return SumRep(*[rep(G) for rep in self.to_sum])
+        return SumRep(*[rep(G) for rep in self.to_sum], G=G)
     def __repr__(self):
         return '('+"+".join(f"{rep}" for rep in self.to_sum)+')'
     def __str__(self):

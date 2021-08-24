@@ -16,32 +16,33 @@ import torch
 from tqdm.auto import tqdm
 
 alpha = 0.0 # regularization parameter: how much to weight equivariance loss
-beta = 1e-4  # regularization parameter: how much to weight generator loss
-gamma = 0.9 # regularization parameter: how much to weight null space loss
+beta = 0.0  # regularization parameter: how much to weight generator loss
+gamma = 0.0 # regularization parameter: how much to weight null space loss
 lr = 8e-4
 epochs = 20000 
 batch_size = 64
 
 n=2
-G = S(n)
+G = SO(n).torchify()
 
-repin = V(2)
-repout = V(2)
-print((repin>>repout))
+repin = V
+repout = V
 Proj, _ = (repin >> repout)(G).equivariant_projector()
 W = torch.Tensor([[0.0,-1.0],[1.0,0.0]])
 W = (Proj @ W.reshape(-1)).reshape(W.shape)
 print(f"True W:\n {W}")
 
 num_layers = 1
-channels=5
+channels = [V+V**2]
+W_ranks = [2]
+b_ranks = [1]
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
 
 def main():
 
     Ghat = LearnedGroup(n,ncontinuous,ndiscrete)
-    model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=channels)
+    model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, W_ranks=W_ranks, b_ranks = b_ranks, num_layers=num_layers, ch=channels)
 
     opt = torch.optim.Adam(model.parameters(),lr=lr)
 
@@ -51,17 +52,25 @@ def main():
     generator_losses = []
     for epoch in tqdm(range(epochs)):
         opt.zero_grad()
-        x = torch.normal(0,1,size=(batch_size, n)).squeeze()
-        y = (W @ x[..., np.newaxis]).squeeze()
-        yhat = model(x)
+        with torch.autograd.detect_anomaly():
+            x = torch.normal(0,1,size=(batch_size, n)).squeeze()
+            y = (W @ x[..., np.newaxis]).squeeze()
+            yhat = model(x)
 
-        model_loss = ((model(x) - y)**2).mean()
-        equivariance_loss = model.equivariance_loss(Ghat)
-        generator_loss = model.generator_loss(Ghat)
-        null_space_loss = model.null_space_loss()
-        loss = (1-alpha-beta-gamma)*model_loss + alpha*equivariance_loss + beta*generator_loss + gamma*null_space_loss
-        loss.backward()
-        opt.step()
+            model_loss = ((model(x) - y)**2).mean()
+            equivariance_loss = model.equivariance_loss(Ghat)
+            generator_loss = model.generator_loss(Ghat)
+            null_space_loss = model.null_space_loss()
+            loss = (1-alpha-beta-gamma)*model_loss + alpha*equivariance_loss + beta*generator_loss + gamma*null_space_loss
+            if True:
+                model_loss.retain_grad()
+                equivariance_loss.retain_grad()
+                generator_loss.retain_grad()
+                null_space_loss.retain_grad()
+                loss.backward()
+                for l,name in [(model_loss, "m-"), (equivariance_loss, "eq-"), (generator_loss, "g-"), (null_space_loss, "n-")]:
+                    print(f"{name}loss: {l}\n{name}loss grad: {l.grad}")
+            opt.step()
 
         model_losses.append(model_loss)
         equivariance_losses.append(equivariance_loss)
