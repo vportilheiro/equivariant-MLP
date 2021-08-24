@@ -23,19 +23,24 @@ epochs = 20000
 batch_size = 64
 
 n=2
-channels=5
+G = S(n)
 
-#W = 3*torch.eye(n) + 2*torch.ones((n,n))
+repin = V(2)
+repout = V(2)
+print((repin>>repout))
+Proj, _ = (repin >> repout)(G).equivariant_projector()
 W = torch.Tensor([[0.0,-1.0],[1.0,0.0]])
+W = (Proj @ W.reshape(-1)).reshape(W.shape)
+print(f"True W:\n {W}")
 
 num_layers = 1
+channels=5
+ncontinuous = len(G.lie_algebra)
+ndiscrete = len(G.discrete_generators)
 
 def main():
 
-    G = SO(n)
-    Ghat = LearnedGroup(n,ncontinuous=1,ndiscrete=0)
-    repin = V(2)
-    repout = V(2)
+    Ghat = LearnedGroup(n,ncontinuous,ndiscrete)
     model = nn.LearnedGroupEMLP(repin, repout, group=Ghat, num_layers=num_layers, ch=channels)
 
     opt = torch.optim.Adam(model.parameters(),lr=lr)
