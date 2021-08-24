@@ -29,13 +29,14 @@ def Sequential(*args):
 class Linear(nn.Linear):
     """ Basic equivariant Linear layer from repin to repout."""
     def __init__(self, repin, repout):
+        self.repin, self.repout = repin, repout
         nin,nout = repin.size(),repout.size()
         super().__init__(nin,nout)
         self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
         self.w = TrainVar(orthogonal((nout, nin)))
         self.rep_W = rep_W = repout*repin.T
         
-        rep_bias = repout
+        self.rep_bias = rep_bias = repout
         self.Pw = rep_W.equivariant_projector()
         self.Pb = rep_bias.equivariant_projector()
         logging.info(f"Linear W components:{rep_W.size()} rep:{rep_W}")
@@ -46,6 +47,16 @@ class Linear(nn.Linear):
         out = x@W.T+b
         logging.debug(f"linear out shape:{out.shape}")
         return out
+
+    def equivariance_loss(self,G,ord=2):
+        return equivariance_loss(self, G, ord)
+
+@export
+class ProjectionRecomputingLinear(Linear):
+    def __call__(self,x):
+        self.Pw = self.rep_W.equivariant_projector()
+        self.Pb = self.rep_bias.equivariant_projector()
+        return super().__call__(x)
 
 @export
 class ApproximatingLinear(nn.Linear):
@@ -60,28 +71,31 @@ class ApproximatingLinear(nn.Linear):
 
     def __call__(self, x):
         return x @ self.w.value.T + self.b.value
+    
+    def equivariance_loss(self,G,ord=2):
+        return equivariance_loss(self, G, ord)
 
-    def equivariance_loss(self, G, ord=2):
-        repin = self.repin(G)
-        repout = self.repout(G)
-        W = self.w.value
-        b = self.b.value
-        loss = 0
-        for h in G.discrete_generators:
-            loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
-            #loss += jnp.linalg.norm(((repin >> repout).rho_dense(h) @ W.reshape(-1)).reshape(W.shape) - W, ord=ord)
+def equivariance_loss(linear_layer, G, ord=2):
+    repin = linear_layer.repin(G)
+    repout = linear_layer.repout(G)
+    W = linear_layer.w.value
+    b = linear_layer.b.value
+    loss = 0
+    for h in G.discrete_generators:
+        loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
+        #loss += jnp.linalg.norm(((repin >> repout).rho_dense(h) @ W.reshape(-1)).reshape(W.shape) - W, ord=ord)
 
-            # NOTE: we have to be quite careful here, since taking the gradient of a 2-norm when the vector
-            # is 0 gives a NaN (https://github.com/google/jax/issues/3058). For this reason we just take the
-            # square norm given by the inned product.
-            diff = (repout.rho_dense(h) @ b - b)
-            loss += diff @ diff
-        for A in G.lie_algebra:
-            loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
+        # NOTE: we have to be quite careful here, since taking the gradient of a 2-norm when the vector
+        # is 0 gives a NaN (https://github.com/google/jax/issues/3058). For this reason we just take the
+        # square norm given by the inned product.
+        diff = (repout.rho_dense(h) @ b - b)
+        loss += diff @ diff
+    for A in G.lie_algebra:
+        loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
 
-            diff = (repout.drho_dense(A) @ b - b)
-            loss += diff @ diff
-        return loss
+        diff = (repout.drho_dense(A) @ b - b)
+        loss += diff @ diff
+    return loss
 
     
 @export

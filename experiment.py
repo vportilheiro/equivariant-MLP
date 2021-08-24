@@ -20,10 +20,10 @@ from tqdm.auto import tqdm
 #from jax.config import config
 #config.update("jax_debug_nans", True)
 
-alpha = 0.4 # regularization parameter: how much to weight equivariance loss 
+alpha = 0.0 # regularization parameter: how much to weight equivariance loss 
 beta = 0.0  # regularization parameter: how much to weight generator loss
 lr = 8e-4
-epochs = 30000 
+epochs = 10000 
 batch_size = 64
 
 # Order of the matrix norm to use in loses
@@ -63,7 +63,7 @@ def main():
     Ghat = LearnedGroup(n,ncontinuous,ndiscrete)
     #Ghat = G
     ngenerators = ncontinuous + ndiscrete
-    model = nn.EMLP(repin, repout, LinearLayer=nn.ApproximatingLinear, group=Ghat, num_layers=num_layers, ch=channels)
+    model = nn.EMLP(repin, repout, LinearLayer=nn.ProjectionRecomputingLinear, group=Ghat, num_layers=num_layers, ch=channels)
 
     opt = objax.optimizer.Adam(model.vars())
 
