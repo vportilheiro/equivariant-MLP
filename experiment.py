@@ -14,11 +14,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import objax
 import jax.numpy as jnp
+from jax import profiler
 from tqdm.auto import tqdm
 
+from jax.config import config
 # For tracing where NaNs come from
-#from jax.config import config
-#config.update("jax_debug_nans", True)
+config.update("jax_debug_nans", True)
+# For examining values inside functions
+config.update('jax_disable_jit', False)
 
 alpha = 0.0 # regularization parameter: how much to weight equivariance loss 
 beta = 0.0  # regularization parameter: how much to weight generator loss
@@ -101,7 +104,7 @@ def main():
         x = objax.random.normal((batch_size, n)).squeeze()
         x_max = x.max(axis=-1)
         y = (W @ x[..., jnp.newaxis]).squeeze() + x_max[:, jnp.newaxis]
-        _, model_loss, equivariance_loss, g_loss = train_op(x, y, lr)
+        loss, model_loss, equivariance_loss, g_loss = train_op(x, y, lr)
 
         model_losses.append(model_loss)
         equivariance_losses.append(equivariance_loss)

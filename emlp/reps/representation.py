@@ -9,7 +9,7 @@ from .linear_operator_base import LinearOperator, Lazy
 from .linear_operators import ConcatLazy, I, lazify, densify, LazyJVP
 import logging
 import matplotlib.pyplot as plt
-from functools import reduce
+from functools import reduce, partial
 from oil.utils.utils import export
 
 from plum import dispatch
@@ -94,13 +94,13 @@ class Rep(object):
         constraints.extend([lazify(self.drho(A)) for A in self.G.lie_algebra])
         return ConcatLazy(constraints) if constraints else lazify(jnp.zeros((1,n)))
 
-    solcache = {}
+    solcache = {} 
     def equivariant_basis(self):  
         """ Computes the equivariant solution basis for the given representation of size N.
             Canonicalizes problems and caches solutions for reuse. Output [Q (N,r)] """
         if self==Scalar: return jnp.ones((1,1))
         canon_rep,perm = self.canonicalize()
-        invperm = np.argsort(perm)
+	invperm = np.argsort(perm)
         if canon_rep not in self.solcache:
             logging.info(f"{canon_rep} cache miss")
             logging.info(f"Solving basis for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
@@ -120,6 +120,19 @@ class Rep(object):
         Q_lazy = lazify(Q)
         P = Q_lazy@Q_lazy.H
         return P
+
+    def equivariant_projector_without_basis(self):
+        if self==Scalar: return jnp.ones((1,1))
+        canon_rep,perm = self.canonicalize()
+        logging.info(f"Solving projector for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
+        #if isinstance(group,Trivial): return np.eye(size(rank,group.d))
+        C_lazy = canon_rep.constraint_matrix()
+        C_dense = C_lazy.to_dense()
+        U,S,VH = jnp.linalg.svd(C_dense,full_matrices=False)
+        rank = (S>1e-5).sum()
+        P = VH[:rank].conj().T # projector on row space (complement of null space)
+        P_lazy = lazify(P)
+        return I(P.shape[0]) - P_lazy @ P_lazy.H
 
     @property
     def concrete(self):
@@ -181,7 +194,6 @@ class Rep(object):
         """ Dual representation V*, rho*, drho*."""
         if hasattr(self,"G") and (self.G is not None) and self.G.is_orthogonal: return self
         return Dual(self)
-
 
 @dispatch
 def mul_reps(ra,rb:int):
