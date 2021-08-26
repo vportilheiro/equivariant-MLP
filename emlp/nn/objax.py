@@ -54,8 +54,8 @@ class Linear(nn.Linear):
 @export
 class ProjectionRecomputingLinear(Linear):
     def __call__(self,x):
-        self.Pw = self.rep_W.equivariant_projector()
-        self.Pb = self.rep_bias.equivariant_projector()
+        self.Pw = self.rep_W.equivariant_projector_without_basis()
+        self.Pb = self.rep_bias.equivariant_projector_without_basis()
         return super().__call__(x)
 
 @export
@@ -93,7 +93,8 @@ def equivariance_loss(linear_layer, G, ord=2):
     for A in G.lie_algebra:
         loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
 
-        diff = (repout.drho_dense(A) @ b - b)
+        # NOTE: bias equivariance depends on the vector norm ||drho(A) b||, NOT ||drho(A) b - b||
+        diff = (repout.drho_dense(A) @ b)
         loss += diff @ diff
     return loss
 

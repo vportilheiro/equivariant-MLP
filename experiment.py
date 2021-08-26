@@ -26,7 +26,7 @@ config.update('jax_disable_jit', False)
 alpha = 0.0 # regularization parameter: how much to weight equivariance loss 
 beta = 0.0  # regularization parameter: how much to weight generator loss
 lr = 8e-4
-epochs = 10000 
+epochs = 10000
 batch_size = 64
 
 # Order of the matrix norm to use in loses
@@ -39,11 +39,11 @@ ndiscrete = len(G.discrete_generators)
 repin = V(G)
 repout = V(G)
 Proj = (repin >> repout).equivariant_projector()
-W = objax.random.normal(shape=(n,n))
+W = np.random.normal(size=(n,n))
 W = (Proj @ W.reshape(-1)).reshape(W.shape)
 
 num_layers = 1
-channels = 4
+channels = 2
 
 def generator_loss(G, repin, repout, ord=2):
         repin = repin(G)
@@ -54,8 +54,9 @@ def generator_loss(G, repin, repout, ord=2):
             H_out = repout.rho_dense(h)
             loss += jnp.linalg.norm(H_in, ord=ord)
             loss += jnp.linalg.norm(H_out, ord=ord)
-            loss -= jnp.linalg.norm(H_in - jnp.eye(H_in.shape[-1]), ord=ord)
-            loss -= jnp.linalg.norm(H_out - jnp.eye(H_out.shape[-1]), ord=ord)
+            # Penalizes being close to the identity
+            #loss -= jnp.linalg.norm(H_in - jnp.eye(H_in.shape[-1]), ord=ord)
+            #loss -= jnp.linalg.norm(H_out - jnp.eye(H_out.shape[-1]), ord=ord)
         for A in G.lie_algebra:
             loss += (jnp.linalg.norm(repin.drho_dense(A), ord=ord) - 1)**2
             loss += (jnp.linalg.norm(repout.drho_dense(A), ord=ord) - 1)**2
@@ -67,6 +68,7 @@ def main():
     #Ghat = G
     ngenerators = ncontinuous + ndiscrete
     model = nn.EMLP(repin, repout, LinearLayer=nn.ProjectionRecomputingLinear, group=Ghat, num_layers=num_layers, ch=channels)
+    print(f"model vars:\n{model.vars()}")
 
     opt = objax.optimizer.Adam(model.vars())
 
@@ -95,13 +97,19 @@ def main():
         opt(lr=lr, grads=g)
         return v
 
+    print(f"True W:\n{W}")
+    print(f"Initial Ghat discrete generators:\n{Ghat.discrete_generators}")
+    print(f"Initial Ghat Lie generators:\n{Ghat.lie_algebra}")
+
+
+
     model_losses = []
     equivariance_losses = []
     generator_losses = []
     equivariance_errors_learned = []
     equivariance_errors_true = []
     for epoch in tqdm(range(epochs)):
-        x = objax.random.normal((batch_size, n)).squeeze()
+        x = np.random.normal(size=(batch_size, n)).squeeze()
         x_max = x.max(axis=-1)
         y = (W @ x[..., jnp.newaxis]).squeeze() + x_max[:, jnp.newaxis]
         loss, model_loss, equivariance_loss, g_loss = train_op(x, y, lr)
@@ -158,8 +166,8 @@ def main():
 
         print()
 
-    print(f"Ghat discrete generators: {Ghat.discrete_generators}")
-    print(f"Ghat Lie generators: {Ghat.lie_algebra}")
+    print(f"Ghat discrete generators:\n{Ghat.discrete_generators}")
+    print(f"Ghat Lie generators:\n{Ghat.lie_algebra}")
 
 if __name__ == "__main__":
     main()

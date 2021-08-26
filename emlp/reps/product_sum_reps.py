@@ -92,6 +92,16 @@ class SumRep(Rep):
             return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
         return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
 
+    def equivariant_projector_without_basis(self):
+        """ Overrides default implementation with a more efficient version which decomposes the constraints
+            across the sum."""
+        Ps = {rep:rep.equivariant_projector_without_basis() for rep in self.reps}
+        multiplicities = self.reps.values()
+        def lazy_P(array):
+            return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
+        return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
+
+
     # ##TODO: investigate why these more idiomatic definitions with Lazy Operators end up slower
     # def equivariant_basis(self):
     #     Qs = [rep.equivariant_basis() for rep in self.reps]
@@ -378,6 +388,11 @@ class DirectProduct(ProductRep):
     def equivariant_projector(self):
         canon_P = LazyKron([rep.equivariant_projector() for rep,c in self.reps.items()])
         return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
+
+    def equivariant_projector_without_basis(self):
+        canon_P = LazyKron([rep.equivariant_projector_without_basis() for rep,c in self.reps.items()])
+        return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
+
 
     def rho(self,Ms):
         canonical_lazy = LazyKron([rep.rho(Ms) for rep,c in self.reps.items() for _ in range(c)])
