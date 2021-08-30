@@ -66,7 +66,7 @@ class SumRep(Rep):
         return SumRepFromCollection(self.reps),self.perm
 
     def __call__(self,G):
-        return SumRepFromCollection({rep.T:c for rep,c in self.reps.items()},perm=self.perm)
+        return SumRepFromCollection({rep:c for rep,c in self.reps.items()},perm=self.perm)
 
     @property
     def concrete(self):
@@ -92,14 +92,27 @@ class SumRep(Rep):
             return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
         return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
 
-    def equivariant_projector_without_basis(self):
+    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False):
         """ Overrides default implementation with a more efficient version which decomposes the constraints
             across the sum."""
-        Ps = {rep:rep.equivariant_projector_without_basis() for rep in self.reps}
+        Ps = {}
+        if return_sv:
+            sv_w_dict_combined = {}
+        for rep in self.reps:
+            if return_sv:
+                P, sv_w_dict = rep.approximately_equivariant_projector(sv_weight_func, return_sv)
+                Ps[rep] = P
+                sv_w_dict_combined.update(sv_w_dict)
+            else:
+                P = rep.approximately_equivariant_projector(sv_weight_func, return_sv)
+                Ps[rep] = P
         multiplicities = self.reps.values()
         def lazy_P(array):
             return lazy_direct_matmat(array[self.perm],Ps.values(),multiplicities)[self.invperm]#[:,self.invperm]
-        return LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
+        Proj = LinearOperator(shape=(self.size(),self.size()),matvec=lazy_P,matmat=lazy_P)
+        if return_sv:
+            return Proj, sv_w_dict_combined
+        return Proj
 
 
     # ##TODO: investigate why these more idiomatic definitions with Lazy Operators end up slower
@@ -389,9 +402,23 @@ class DirectProduct(ProductRep):
         canon_P = LazyKron([rep.equivariant_projector() for rep,c in self.reps.items()])
         return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
 
-    def equivariant_projector_without_basis(self):
-        canon_P = LazyKron([rep.equivariant_projector_without_basis() for rep,c in self.reps.items()])
-        return LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
+    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False):
+        Ps = []
+        if return_sv:
+            sv_w_dict_combined = {}
+        for rep in self.reps:
+            if return_sv:
+                P, sv_w_dict = rep.approximately_equivariant_projector(sv_weight_func, return_sv)
+                Ps.append(P)
+                sv_w_dict_combined.update(sv_w_dict)
+            else:
+                P = rep.approximately_equivariant_projector(sv_weight_func, return_sv)
+                Ps.append(P)
+        canon_P = LazyKron(Ps)
+        Proj = LazyPerm(self.invperm)@canon_P@LazyPerm(self.perm)
+        if return_sv:
+            return Proj, sv_w_dict_combined
+        return Proj
 
 
     def rho(self,Ms):

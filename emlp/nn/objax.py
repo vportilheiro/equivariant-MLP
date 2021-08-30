@@ -26,25 +26,39 @@ def Sequential(*args):
     return nn.Sequential(args)
 
 @export
-class Linear(nn.Linear):
+class Linear(Module):
     """ Basic equivariant Linear layer from repin to repout."""
     def __init__(self, repin, repout):
         self.repin, self.repout = repin, repout
         nin,nout = repin.size(),repout.size()
-        super().__init__(nin,nout)
-        self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
-        self.w = TrainVar(orthogonal((nout, nin)))
+        #super().__init__(nin,nout)
         self.rep_W = rep_W = repout*repin.T
-        
         self.rep_bias = rep_bias = repout
+
+        self.W_pre_proj = TrainVar(orthogonal((nout, nin)))
+        self.b_pre_proj = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+
         self.Pw = rep_W.equivariant_projector()
         self.Pb = rep_bias.equivariant_projector()
+
         logging.info(f"Linear W components:{rep_W.size()} rep:{rep_W}")
+
+    @property
+    def W(self):
+        #vec_W_pre_proj = self.W_pre_proj.reshape(-1)
+        #vec_W = self.Pw @ vec_W_pre_proj
+        #W_shape = self.W_pre_proj.shape
+        #W = vec_W.reshape(W_shape)
+        #return W
+        return (self.Pw @ self.W_pre_proj.reshape(-1)).reshape(*self.W_pre_proj.shape)
+
+    @property
+    def b(self):
+        return self.Pb @ self.b_pre_proj#.value
+
     def __call__(self, x): # (cin) -> (cout)
         logging.debug(f"linear in shape: {x.shape}")
-        W = (self.Pw@self.w.value.reshape(-1)).reshape(*self.w.value.shape)
-        b = self.Pb@self.b.value
-        out = x@W.T+b
+        out = x @ self.W.T + self.b
         logging.debug(f"linear out shape:{out.shape}")
         return out
 
@@ -53,24 +67,37 @@ class Linear(nn.Linear):
 
 @export
 class ProjectionRecomputingLinear(Linear):
-    def __call__(self,x):
-        self.Pw = self.rep_W.equivariant_projector_without_basis()
-        self.Pb = self.rep_bias.equivariant_projector_without_basis()
-        return super().__call__(x)
+    def __init__(self, repin, repout, sv_weight_func=None):
+        self.sv_weight_func = sv_weight_func
+        self.sv_w_dict = {}
+        super().__init__(repin,repout)
+
+    @property
+    def W(self):
+        self.Pw, sv_w_W = self.rep_W.approximately_equivariant_projector(self.sv_weight_func, return_sv=True)
+        self.sv_w_dict.update(sv_w_W)
+        return super().W
+
+    @property
+    def b(self):
+        self.Pb, sv_w_b = self.rep_bias.approximately_equivariant_projector(self.sv_weight_func, return_sv=True)
+        self.sv_w_dict.update(sv_w_b)
+        return super().b
 
 @export
-class ApproximatingLinear(nn.Linear):
+class ApproximatingLinear(objax.Module):
     """ A vanilla linear layer from repin to repout which knows how to calculate
         an "approximate equivariance loss". """
     def __init__(self, repin, repout):
         self.repin, self.repout = repin, repout
+        self.rep_W, self.rep_bias = (repin >> repout), repout
         nin,nout = repin.size(),repout.size()
-        super().__init__(nin,nout)
+        #super().__init__(nin,nout)
+        self.W = TrainVar(orthogonal((nout, nin)))
         self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
-        self.w = TrainVar(orthogonal((nout, nin)))
 
     def __call__(self, x):
-        return x @ self.w.value.T + self.b.value
+        return x @ self.W.T + self.b
     
     def equivariance_loss(self,G,ord=2):
         return equivariance_loss(self, G, ord)
@@ -78,8 +105,8 @@ class ApproximatingLinear(nn.Linear):
 def equivariance_loss(linear_layer, G, ord=2):
     repin = linear_layer.repin(G)
     repout = linear_layer.repout(G)
-    W = linear_layer.w.value
-    b = linear_layer.b.value
+    W = linear_layer.W
+    b = linear_layer.b
     loss = 0
     for h in G.discrete_generators:
         loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)

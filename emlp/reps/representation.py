@@ -121,29 +121,50 @@ class Rep(object):
         P = Q_lazy@Q_lazy.H
         return P
 
-    def equivariant_projector_without_basis(self):
-        """ Computes the equivariant projector without computing the equivariant basis first.
+    def approximately_equivariant_basis(self, sv_weight_func=None, return_sv=False):
+        """ Computes the approximately equivariant basis by using a multiplicative mask/weight,
+            applied to the singular values of the contraint matrix to select the right singular vectors.
             This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
             not able to take derivatives. 
             NOTE: In a formalizable sense, most matrices C_dense will have all non-zero singular
-            values, making the returned projector the zero matrix. """
-        if Scalar == self: return jnp.ones((1,1))
+            values, making the returned projector the zero matrix/empty if the sv_weight_func doesn't
+            select any vectors. This will kill any backpropagating signal. """
+        if Scalar == self: 
+            if return_sv:
+                return jnp.ones((1,1)), {self: (jnp.zeros(1), jnp.ones(1))}
+            return jnp.ones((1,1))
         logging.info(f"Solving projector for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
         #if isinstance(group,Trivial): return np.eye(size(rank,group.d))
         C_lazy = self.constraint_matrix()
         C_dense = C_lazy.to_dense()
         U,S,VH = jnp.linalg.svd(C_dense,full_matrices=False)
 
-        # Old rank selection mechanism, not differentiable in JAX due to dynamic slice size
-        #rank = (S>1e-5).sum()
-        #P = VH[:rank].conj().T # projector on row space (complement of null space)
-
         # Mask out rows of VH for which the singular values are small
-        S_mask = (S>1e-5)[:, jnp.newaxis] # TODO(?) make this a soft threshold
-        P = (S_mask * VH).conj().T # projector on row space (complement of null space)
+        if sv_weight_func is None:
+            sv_weight_func = lambda S: S<1e-5
+        S_mask = sv_weight_func(S)
+        Q = (S_mask[:, np.newaxis] * VH).conj().T # projector onto null-space
+        if return_sv:
+            return Q, {self: (S, S_mask)}
+        return Q
 
-        P_lazy = lazify(P)
-        return I(P.shape[0]) - P_lazy @ P_lazy.H
+
+    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False):
+        """ Computes the equivariant projector by using a multiplicative mask.
+            This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
+            not able to take derivatives. 
+            NOTE: In a formalizable sense, most matrices C_dense will have all non-zero singular
+            values, making the returned projector the zero matrix. """
+        if return_sv:
+            Q, sv_w_dict = self.approximately_equivariant_basis(sv_weight_func, return_sv)
+        else:
+            Q = self.approximately_equivariant_basis(sv_weight_func, return_sv)
+
+        Q_lazy = lazify(Q)
+        Proj = Q_lazy @ Q_lazy.H
+        if return_sv:
+            return Proj, sv_w_dict
+        return Proj
 
     @property
     def concrete(self):
