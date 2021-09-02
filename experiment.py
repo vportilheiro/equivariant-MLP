@@ -4,9 +4,13 @@
 # the symmetric group.
 #####
 
+# Logging must be set up before any JAX imports
+import logging
+logging.basicConfig(filename='experiment.log', encoding='utf-8', level=logging.DEBUG)
+
 import emlp
-from emlp.learned_group import LearnedGroup
-from emlp.groups import S, SO, O
+from emlp.learned_group import LearnedGroup, equivariance_loss
+from emlp.groups import S, SO, O, Trivial
 from emlp.reps import V, equivariance_error
 import emlp.nn as nn
 
@@ -18,35 +22,49 @@ import jax.numpy as jnp
 from jax.lax import dynamic_update_slice
 from tqdm.auto import tqdm
 
-from jax.config import config
-# For tracing where NaNs come from
-config.update("jax_debug_nans", True)
-# For examining values inside functions
-config.update('jax_disable_jit', False)
+##### Debuggin options #####
 
-alpha = 0.9 # regularization parameter: how much to weight equivariance loss 
+from jax.config import config
+config.update("jax_debug_nans", False) # For tracing where NaNs come from
+config.update('jax_disable_jit', False) # For examining values inside functions
+
+##### Training hyperparameters #####
+
+alpha = 0.0 # regularization parameter: how much to weight equivariance loss 
 beta = 0.0  # regularization parameter: how much to weight generator loss
-gamma = 0.0  # regularization parameter: how much to weight projection loss
-lr = 8e-4
+gamma = 0.9  # regularization parameter: how much to weight projection loss
+lr = 1e-4
 epochs = 20000
 batch_size = 64
 
-# Order of the matrix norm to use in loses
+# Order of the matrix norm to use in losses
 ord=2
 
-n=2
-G = O(n)
+# Model parameters
+num_layers = 1
+channels = V**0 + V
+
+##### Task setup #####
+
+n = 3
+G = S(n)
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
 repin = V(G)
 repout = V(G)
-Proj = (repin >> repout).equivariant_projector()
-W = np.random.normal(size=(n,n))
-W = (Proj @ W.reshape(-1)).reshape(W.shape)
 
-num_layers = 1
-channels = V**0 + V
+def get_equivariant_W():
+    Proj = (repin >> repout).equivariant_projector()
+    W = np.random.normal(size=(n,n))
+    W = (Proj @ W.reshape(-1)).reshape(W.shape)
+    return W
 
+def W_map(W):
+    return lambda x: (W @ x[..., jnp.newaxis]).squeeze()
+
+W = get_equivariant_W()
+f = W_map(W)
+ 
 def generator_loss(G, repin, repout, ord=2):
         repin = repin(G)
         repout = repout(G)
@@ -68,6 +86,7 @@ def main():
 
     Ghat = LearnedGroup(n,ncontinuous,ndiscrete)
     #Ghat = G
+    #Ghat = Trivial(n)
     ngenerators = ncontinuous + ndiscrete
 
     class RankOneLinear(nn.ProjectionRecomputingLinear):
@@ -76,8 +95,8 @@ def main():
         def projection_loss(self):
             return sum((S*mask) @ (S*mask) for (S,mask) in self.sv_w_dict.values())
 
-    model = nn.EMLP(repin, repout, LinearLayer=nn.ApproximatingLinear, group=Ghat, num_layers=num_layers, ch=channels)
-    print(f"model vars:\n{model.vars()}")
+    model = nn.EMLP(repin, repout, LinearLayer=RankOneLinear, group=Ghat, num_layers=num_layers, ch=channels)
+    print(f"model vars:\n{model.vars()}\n")
 
     opt = objax.optimizer.Adam(model.vars())
 
@@ -91,12 +110,15 @@ def main():
         for l, layer in enumerate(model.network):
             if l < L - 1:
                 equivariance_loss += layer.linear.equivariance_loss(Ghat, ord) / (L * ngenerators)
-                #projection_loss += layer.linear.projection_loss() / L
+                if gamma > 0:
+                    projection_loss += layer.linear.projection_loss() / L
             else:
                 equivariance_loss += layer.equivariance_loss(Ghat, ord) / (L * ngenerators)
-                #projection_loss += layer.projection_loss() / L
+                if gamma > 0:
+                    projection_loss += layer.projection_loss() / L
         model_loss = ((yhat-y)**2).mean()
-        g_loss = generator_loss(Ghat, repin, repout, ord) / ngenerators
+        g_loss = 0
+        g_loss += generator_loss(Ghat, repin, repout, ord) / ngenerators
         return (1-alpha-beta-gamma)*model_loss + alpha*equivariance_loss + beta*g_loss + gamma * projection_loss, \
                 model_loss, equivariance_loss, g_loss, projection_loss
 
@@ -109,7 +131,7 @@ def main():
         opt(lr=lr, grads=g)
         return v
 
-    print(f"True W:\n{W}")
+    #print(f"True W:\n{W}")
     print(f"Initial Ghat discrete generators:\n{Ghat.discrete_generators}")
     print(f"Initial Ghat Lie generators:\n{Ghat.lie_algebra}")
 
@@ -118,9 +140,8 @@ def main():
     generator_losses = []
     projection_losses = []
     for epoch in tqdm(range(epochs)):
-        x = np.random.normal(size=(batch_size, n)).squeeze()
-        x_max = x.max(axis=-1)
-        y = (W @ x[..., jnp.newaxis]).squeeze() + x_max[:, jnp.newaxis]
+        x = np.random.normal(size=(batch_size, repin.size())).squeeze()
+        y = f(x)
         loss, model_loss, equivariance_loss, g_loss, proj_loss = train_op(x, y, lr)
 
         model_losses.append(model_loss)
@@ -155,11 +176,19 @@ def main():
     #ax_true.set_title("True equivariance error")
     
     plt.show()
+
+    print_layer_info(model, Ghat)
+
+    print(f"Ghat discrete generators:\n{Ghat.discrete_generators}")
+    print(f"Ghat Lie generators:\n{Ghat.lie_algebra}")
     
+
+def print_layer_info(model, Ghat):
     for l in range(num_layers+1):
         print(f"===== Layer {l} =====")
         linear = model.network[l].linear if l < num_layers else model.network[l]
-        print(f"equivariance loss = {linear.equivariance_loss(Ghat)}")
+        print(f"layer Ghat equivariance loss = {linear.equivariance_loss(Ghat)}")
+        print(f"layer G equivariance loss = {linear.equivariance_loss(G)}")
         #print(f"projection loss = {linear.projection_loss()}")
         print()
 
@@ -177,6 +206,9 @@ def main():
             print(f"Lie generator rep:\n{linear.repout(G).drho_dense(A)}")
         print()
 
+        print(f"b:\n{linear.b}")
+        print()
+
         print(f"rep_W: {linear.rep_W}")
         for h in Ghat.discrete_generators:
             print(f"discrete generator rep:\n{linear.rep_W(G).rho_dense(h)}")
@@ -185,13 +217,22 @@ def main():
         print()
 
         print(f"W: {linear.repin} to {linear.repout}\n{linear.W}")
-        err = equivariance_error(linear.W, linear.repin(Ghat), linear.repout(Ghat), Ghat)
-        print(f"equivariance error: {err}")
-
         print()
 
-    print(f"Ghat discrete generators:\n{Ghat.discrete_generators}")
-    print(f"Ghat Lie generators:\n{Ghat.lie_algebra}")
+        Ghat_err = equivariance_error(linear.W, linear.repin(Ghat), linear.repout(Ghat), Ghat)
+        print(f"What Ghat equivariance error: {Ghat_err}")
+        G_err = equivariance_error(linear.W, linear.repin(G), linear.repout(G), G)
+        print(f"What G equivariance error: {G_err}")
+        print()
+
+    Ghat_err = equivariance_error(W, repin(Ghat), repout(Ghat), Ghat)
+    print(f"W Ghat equivariance error: {Ghat_err}")
+    G_err = equivariance_error(W, repin(G), repout(G), G)
+    print(f"W G equivariance error: {G_err}")
+    print(f"W Ghat equivariance loss: {equivariance_loss(Ghat, repin, repout, W)}")
+    print(f"W G equivariance loss: {equivariance_loss(G, repin, repout, W)}")
+    print()
+
 
 if __name__ == "__main__":
     main()

@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import objax.nn as nn
 import objax.functional as F
 import numpy as np
+from emlp.learned_group import equivariance_loss
 from emlp.reps import T,Rep,Scalar
 from emlp.reps import bilinear_weights
 from emlp.reps.product_sum_reps import SumRep
@@ -63,7 +64,7 @@ class Linear(Module):
         return out
 
     def equivariance_loss(self,G,ord=2):
-        return equivariance_loss(self, G, ord)
+        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord)
 
 @export
 class ProjectionRecomputingLinear(Linear):
@@ -85,6 +86,29 @@ class ProjectionRecomputingLinear(Linear):
         return super().b
 
 @export
+class NoOptProjectionRecomputingLinear(Linear):
+    """ The idea for this layer is to be like ProjectionRecomputingLinear, but not using any of the
+        SVD decomposition across sum/product representations, instead solving the whole constraint
+        across all the representations directly.
+        NOTE: currently does not work, since SumReps do not have a self.G """
+    def __init__(self, repin, repout, sv_weight_func=None):
+        self.sv_weight_func = sv_weight_func
+        self.sv_w_dict = {}
+        super().__init__(repin,repout)
+
+    @property
+    def W(self):
+        self.Pw, sv_w_W = Rep.approximately_equivariant_projector(self.rep_W, self.sv_weight_func, return_sv=True)
+        self.sv_w_dict.update(sv_w_W)
+        return super().W
+
+    @property
+    def b(self):
+        self.Pb, sv_w_b = Rep.approximately_equivariant_projector(self.rep_bias, elf.sv_weight_func, return_sv=True)
+        self.sv_w_dict.update(sv_w_b)
+        return super().b
+
+@export
 class ApproximatingLinear(objax.Module):
     """ A vanilla linear layer from repin to repout which knows how to calculate
         an "approximate equivariance loss". """
@@ -93,37 +117,22 @@ class ApproximatingLinear(objax.Module):
         self.rep_W, self.rep_bias = (repin >> repout), repout
         nin,nout = repin.size(),repout.size()
         #super().__init__(nin,nout)
-        self.W = TrainVar(orthogonal((nout, nin)))
-        self.b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+        self._W = TrainVar(orthogonal((nout, nin)))
+        self._b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
 
     def __call__(self, x):
         return x @ self.W.T + self.b
+
+    @property
+    def W(self):
+        return self._W.value
+
+    @property
+    def b(self):
+        return self._b.value
     
     def equivariance_loss(self,G,ord=2):
-        return equivariance_loss(self, G, ord)
-
-def equivariance_loss(linear_layer, G, ord=2):
-    repin = linear_layer.repin(G)
-    repout = linear_layer.repout(G)
-    W = linear_layer.W
-    b = linear_layer.b
-    loss = 0
-    for h in G.discrete_generators:
-        loss += jnp.linalg.norm(repout.rho_dense(h) @ W - W @ repin.rho_dense(h), ord=ord)
-        #loss += jnp.linalg.norm(((repin >> repout).rho_dense(h) @ W.reshape(-1)).reshape(W.shape) - W, ord=ord)
-
-        # NOTE: we have to be quite careful here, since taking the gradient of a 2-norm when the vector
-        # is 0 gives a NaN (https://github.com/google/jax/issues/3058). For this reason we just take the
-        # square norm given by the inned product.
-        diff = (repout.rho_dense(h) @ b - b)
-        loss += diff @ diff
-    for A in G.lie_algebra:
-        loss += jnp.linalg.norm(repout.drho_dense(A) @ W - W @ repin.drho_dense(A), ord=ord)
-
-        # NOTE: bias equivariance depends on the vector norm ||drho(A) b||, NOT ||drho(A) b - b||
-        diff = (repout.drho_dense(A) @ b)
-        loss += diff @ diff
-    return loss
+        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord)
 
     
 @export

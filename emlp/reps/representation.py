@@ -138,6 +138,7 @@ class Rep(object):
         C_lazy = self.constraint_matrix()
         C_dense = C_lazy.to_dense()
         U,S,VH = jnp.linalg.svd(C_dense,full_matrices=False)
+        logging.info(f"C:\n{C_dense}\nU:\n{U}\nS:{S}\nV:\n{V}")
 
         # Mask out rows of VH for which the singular values are small
         if sv_weight_func is None:
@@ -147,7 +148,6 @@ class Rep(object):
         if return_sv:
             return Q, {self: (S, S_mask)}
         return Q
-
 
     def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False):
         """ Computes the equivariant projector by using a multiplicative mask.
