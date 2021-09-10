@@ -138,10 +138,14 @@ class Trivial(Group):
         self.d = n
         super().__init__(n)
 
+    def __str__(self):
+        return "Trivial"
+
 @export
 class SO(Group):
     """ The special orthogonal group SO(n) in n dimensions"""
     def __init__(self,n):
+        self.n = n
         self.lie_algebra = np.zeros(((n*(n-1))//2,n,n))
         k=0
         for i in range(n):
@@ -150,14 +154,19 @@ class SO(Group):
                 self.lie_algebra[k,j,i] = -1
                 k+=1
         super().__init__(n)
+    def __str__(self):
+        return f"SO({self.d})"
 
 @export
 class O(SO):
     """ The Orthogonal group O(n) in n dimensions"""
     def __init__(self,n):
+        self.n = n
         self.discrete_generators = np.eye(n)[None]
         self.discrete_generators[0,0,0]=-1
         super().__init__(n)
+    def __str__(self):
+        return f"O({self.d})"
 
 @export
 class C(Group):
@@ -167,6 +176,7 @@ class C(Group):
         self.discrete_generators = np.zeros((1,2,2))
         self.discrete_generators[0,:,:] = np.array([[np.cos(theta),np.sin(theta)],[-np.sin(theta),np.cos(theta)]])
         super().__init__(k)
+
 @export
 class D(C):
     """ The Dihedral group Dk in 2 dimensions"""
@@ -270,6 +280,8 @@ class S(Group): #The permutation group
         # adding superflous extra generators surprisingly can sometimes actually *decrease* 
         # the runtime of the iterative krylov solver by improving the conditioning 
         # of the constraint matrix
+    def __str__(self):
+        return f"S({self.d})"
 
 @export
 class SL(Group):
@@ -350,6 +362,7 @@ class SU(Group):  # Of dimension n^2-1
             k+=1
         self.lie_algebra = lie_algebra_real + lie_algebra_imag*1j
         super().__init__(n)
+
 
 @export
 class Cube(Group):

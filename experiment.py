@@ -6,36 +6,53 @@
 
 # Logging must be set up before any JAX imports
 import logging
-logging.basicConfig(filename='experiment.log', encoding='utf-8', level=logging.DEBUG)
+logging.basicConfig(filename='experiment.log', encoding='utf-8', level=logging.INFO)
 
 import emlp
-from emlp.learned_group import LearnedGroup, equivariance_loss
-from emlp.groups import S, SO, O, Trivial
+from emlp.learned_group import LearnedGroup, equivariance_loss, generator_loss
+from emlp.groups import S, Z, SO, O, Trivial
 from emlp.reps import V, equivariance_error
 import emlp.nn as nn
 
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 import objax
 import jax
 import jax.numpy as jnp
-from jax.lax import dynamic_update_slice
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm, trange
+
+# TODO: why does svd lead to multiple copies of/same generators?
+# NOTE: check "normalize" option in equivariance_loss
 
 ##### Debuggin options #####
 
 from jax.config import config
-config.update("jax_debug_nans", False) # For tracing where NaNs come from
+config.update("jax_debug_nans", True) # For tracing where NaNs come from
 config.update('jax_disable_jit', False) # For examining values inside functions
 
 ##### Training hyperparameters #####
 
-alpha = 0.0 # regularization parameter: how much to weight equivariance loss 
-beta = 0.0  # regularization parameter: how much to weight generator loss
-gamma = 0.9  # regularization parameter: how much to weight projection loss
+reg_eq = 0.3        # regularization parameter: how much to weight equivariance loss 
+reg_gen = 0.0 #1e-8 # regularization parameter: how much to weight generator loss
+reg_proj = 0.00     # regularization parameter: how much to weight projection loss
+reg_sv = 0.00       # how much to weight loss from singular values
 lr = 1e-4
-epochs = 20000
-batch_size = 64
+epochs = 4*40000
+
+# We define the dataset size by the number of batches and batch size.
+# We have different kinds of batches: "all" for those used to update all parameters,
+# "weights" for those updating only model weights, "gen" for updating only Ghat's generators.
+batch_size = 8
+dataset_size = 1 * batch_size 
+batch_types = ["all", "weights", "gen"] # each epoch trains in this order
+num_batches = {"all": 10000, "weights": 0, "gen": 0}
+num_batches = {batch_type: min(num, dataset_size//batch_size) for batch_type, num in num_batches.items()}
+num_val_batches = 1     # Used for validation every epoch. Currently, validation data is resampled each epoch.
+
+resample_data = 40000          # How many epochs before a new dataset is sampled
+resample_W = 40000             # How many epochs before a new W is sampled
+reset_model_on_resample = True  # If true, the model weights are re-initialized on each resample of W
 
 # Order of the matrix norm to use in losses
 ord=2
@@ -46,192 +63,297 @@ channels = V**0 + V
 
 ##### Task setup #####
 
-n = 3
-G = S(n)
+n = 2
+G = SO(n)
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
-repin = V(G)
-repout = V(G)
+repin = V 
+repout = V
 
 def get_equivariant_W():
-    Proj = (repin >> repout).equivariant_projector()
-    W = np.random.normal(size=(n,n))
+    Proj = (repin >> repout)(G).equivariant_projector()
+    W = np.random.normal(size=(repout(G).size(),repin(G).size()))
     W = (Proj @ W.reshape(-1)).reshape(W.shape)
     return W
 
-def W_map(W):
+def equivariant_space_rank():
+    return (repin >> repout)(G).equivariant_basis().shape[1]
+
+def map_from_matrix(W):
     return lambda x: (W @ x[..., jnp.newaxis]).squeeze()
 
-W = get_equivariant_W()
-f = W_map(W)
- 
-def generator_loss(G, repin, repout, ord=2):
-        repin = repin(G)
-        repout = repout(G)
-        loss = 0
-        for h in G.discrete_generators:
-            H_in = repin.rho_dense(h)
-            H_out = repout.rho_dense(h)
-            loss += jnp.linalg.norm(H_in, ord=ord)
-            loss += jnp.linalg.norm(H_out, ord=ord)
-            # Penalizes being close to the identity
-            #loss -= jnp.linalg.norm(H_in - jnp.eye(H_in.shape[-1]), ord=ord)
-            #loss -= jnp.linalg.norm(H_out - jnp.eye(H_out.shape[-1]), ord=ord)
-        for A in G.lie_algebra:
-            loss += jnp.linalg.norm(repin.drho_dense(A), ord=ord)
-            loss += jnp.linalg.norm(repout.drho_dense(A), ord=ord)
-        return loss
-
 def main():
+
+    ##### Initialize task ##### 
+
+    W = get_equivariant_W()
+    f = map_from_matrix(W)
+
+    ##### Model and optimizer definition #####
 
     Ghat = LearnedGroup(n,ncontinuous,ndiscrete)
     #Ghat = G
     #Ghat = Trivial(n)
     ngenerators = ncontinuous + ndiscrete
 
-    class RankOneLinear(nn.ProjectionRecomputingLinear):
-        def __init__(self, repin, repout):
-            super().__init__(repin, repout, lambda S: dynamic_update_slice(jnp.zeros_like(S), jnp.ones(1), [-1]))
-        def projection_loss(self):
-            return sum((S*mask) @ (S*mask) for (S,mask) in self.sv_w_dict.values())
+    #model = nn.EMLP(repin, repout, \
+    #        #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
+    #        LinearLayer=nn.ApproximatingLinear,
+    #        group=Ghat, num_layers=num_layers, ch=channels)
+    model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=True)])
+    #model = nn.Network(Ghat, [
+    #    nn.SoftSVDLinear(1, use_bias=True,
+    #                    sv_offset=1e-4,
+    #                    sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5)),
+    #                    sv_loss_dict={V(Ghat) :(lambda S: 0), V: (lambda S:0)},
+    #                    )(repin(Ghat), repout(Ghat))
+    #    ])
+    #model = nn.Network(Ghat, [nn.RankKLinear(2, sv_loss_func=lambda S:0)(repin(Ghat), repout(Ghat), use_bias=False, sv_offset=1e-4)])
 
-    model = nn.EMLP(repin, repout, LinearLayer=RankOneLinear, group=Ghat, num_layers=num_layers, ch=channels)
-    print(f"model vars:\n{model.vars()}\n")
+    all_vars = model.vars()
+    gen_vars = objax.VarCollection((k,v) for k,v in all_vars.items() if "LearnedGroup" in k)
+    weight_vars = objax.VarCollection((k,v) for k,v in all_vars.items() if "LearnedGroup" not in k)
 
-    opt = objax.optimizer.Adam(model.vars())
+
+    opt_all = objax.optimizer.Adam(all_vars)
+    opt_weights = objax.optimizer.Adam(weight_vars)
+    opt_gen = objax.optimizer.Adam(gen_vars)
+
+    ##### objax functions #####
 
     @objax.Jit
-    @objax.Function.with_vars(model.vars())
+    @objax.Function.with_vars(gen_vars)
+    def Ghat_equivariance(W):
+        return equivariance_loss(Ghat, repin, repout, W, ord=ord)
+
+    @objax.Jit
+    @objax.Function.with_vars(gen_vars)
+    def Ghat_non_triviality():
+        result = 0
+        for h in Ghat.discrete_generators:
+            result += jnp.linalg.norm(h - jnp.eye(h.shape[0]), ord=ord)
+        for A in Ghat.lie_algebra:
+            result += jnp.linalg.norm(A, ord=ord)
+        return {"/non-triviality/Ghat": result / ngenerators}
+
+    @objax.Jit
+    @objax.Function.with_vars(all_vars)
     def loss(x, y):
         yhat = model(x)
-        equivariance_loss = 0
-        projection_loss = 0
         L = len(model.network)
+        losses = defaultdict(float)
         for l, layer in enumerate(model.network):
-            if l < L - 1:
-                equivariance_loss += layer.linear.equivariance_loss(Ghat, ord) / (L * ngenerators)
-                if gamma > 0:
-                    projection_loss += layer.linear.projection_loss() / L
-            else:
-                equivariance_loss += layer.equivariance_loss(Ghat, ord) / (L * ngenerators)
-                if gamma > 0:
-                    projection_loss += layer.projection_loss() / L
-        model_loss = ((yhat-y)**2).mean()
-        g_loss = 0
-        g_loss += generator_loss(Ghat, repin, repout, ord) / ngenerators
-        return (1-alpha-beta-gamma)*model_loss + alpha*equivariance_loss + beta*g_loss + gamma * projection_loss, \
-                model_loss, equivariance_loss, g_loss, projection_loss
+            if l < L - 1: linear = layer.linear
+            else: linear = layer
+            # Ghat equivariance
+            losses[f"layer {l}/equivariance/layer-Ghat"] = Ghat_eq = \
+                    linear.equivariance_loss(Ghat, ord=ord) / ngenerators
+            losses["/equivariance/model-Ghat"] += Ghat_eq / L
 
-    grad_and_val = objax.GradValues(loss, model.vars())
+            # G equivariance
+            # NOTE: do not use these losses for learning! They are for validation purposes only, as they
+            # checks whether the model is equivariant under the unknown symmetry group G
+            losses[f"layer {l}/equivariance/layer-G"] = G_eq = \
+                    linear.equivariance_loss(G, ord=ord) / ngenerators
+            losses["/equivariance/model-G"] += G_eq / L
+
+            # weight norm
+            losses[f"layer {l}/norm/What"] = W_norm = jnp.linalg.norm(linear.W, ord=ord)
+            losses[f"/norm/What"] += W_norm / L
+
+            if reg_proj > 0:
+                losses["/svd/proj"] += linear.projection_loss() / L
+
+            if reg_sv > 0:
+                losses["/svd/sv"] += linear.sv_loss() / L
+
+        losses["/prediction/train"] = ((yhat-y)**2).mean()
+        losses["/norm/generators"] = generator_loss(Ghat, ord) / ngenerators
+        p = losses["/svd/proj"] if reg_proj > 0 else 0
+        s = losses["/svd/sv"] if reg_sv > 0 else 0
+        m, e, g = losses["/prediction/train"], losses["/equivariance/model-Ghat"], \
+                     losses["/norm/generators"]
+        return ((1-reg_eq-reg_gen-reg_proj-reg_sv)*m+ reg_eq*e + reg_gen*g + reg_proj*p + reg_sv*s), losses
 
     @objax.Jit
-    @objax.Function.with_vars(model.vars()+opt.vars())
-    def train_op(x, y, lr):
-        g, v = grad_and_val(x, y)
-        opt(lr=lr, grads=g)
+    @objax.Function.with_vars(all_vars)
+    def loss_with_W_equiv(x,y):
+        training_loss, losses = loss(x,y)
+        W_Ghat = Ghat_equivariance(W)
+        losses["/equivariance/W-Ghat"] = W_Ghat
+        return training_loss, losses
+
+    grad_and_val_all = objax.GradValues(loss_with_W_equiv, all_vars)
+    grad_and_val_weights = objax.GradValues(loss, weight_vars)
+    grad_and_val_gen = objax.GradValues(loss_with_W_equiv, gen_vars)
+
+    @objax.Jit
+    @objax.Function.with_vars(all_vars+opt_all.vars())
+    def train_op_all(x, y, lr):
+        g, v = grad_and_val_all(x, y)
+        opt_all(lr=lr, grads=g)
         return v
 
-    #print(f"True W:\n{W}")
+    @objax.Jit
+    @objax.Function.with_vars(all_vars+opt_weights.vars())
+    def train_op_weights(x, y, lr):
+        g, v = grad_and_val_weights(x, y)
+        opt_weights(lr=lr, grads=g)
+        return v
+
+    @objax.Jit
+    @objax.Function.with_vars(all_vars+opt_gen.vars())
+    def train_op_gen(x, y, lr):
+        g, v = grad_and_val_gen(x, y)
+        opt_gen(lr=lr, grads=g)
+        return v
+
+    train_ops = {"all": train_op_all, "weights": train_op_weights, "gen": train_op_gen}
+
+    ##### print info #####
+
+    print(f"model vars:\n{model.vars()}\n")
+    print(f"True G: {G}")
+    print(f"repin: {repin}, repout: {repout}")
+    print(f"equivariant space rank: {equivariant_space_rank()}")
+    if not resample_W: print(f"True W:\n{W}\n")
+    else: print("True W: resampled every epoch (resample_W=True)")
     print(f"Initial Ghat discrete generators:\n{Ghat.discrete_generators}")
     print(f"Initial Ghat Lie generators:\n{Ghat.lie_algebra}")
+    print()
 
-    model_losses = []
-    equivariance_losses = []
-    generator_losses = []
-    projection_losses = []
-    for epoch in tqdm(range(epochs)):
-        x = np.random.normal(size=(batch_size, repin.size())).squeeze()
-        y = f(x)
-        loss, model_loss, equivariance_loss, g_loss, proj_loss = train_op(x, y, lr)
+    print(f"Dataset size: {dataset_size}")
+    print(f"Effective dataset size (size * epochs): {epochs * dataset_size}")
+    if resample_data < np.inf:
+        print(f"Input datapoints are resampled every {resample_data} epochs")
+    if resample_W < np.inf:
+        print(f"True W matrix is resampled every {resample_W} epochs")
+        if reset_model_on_resample: 
+            print(f"Note: reset_model_on_resample=True, so the resamples of W trigger model weight re-initialization")
 
-        model_losses.append(model_loss)
-        equivariance_losses.append(equivariance_loss)
-        generator_losses.append(g_loss)
-        projection_losses.append(proj_loss)
+    ##### Training loop #####
 
-        # Get equivariance error for first layer in network
-        #linear = model.network[0].linear
-        #equivariance_errors_learned.append(equivariance_error(linear.w, linear.repin(Ghat), linear.repout(Ghat), Ghat))
-        #equivariance_errors_true.append(equivariance_error(linear.w, linear.repin(G), linear.repout(G), G))
+    losses = defaultdict(list)
+    batch_idx = 0 # time index of current training batch, for book-keeping
+    for epoch in trange(epochs, desc="epochs"):
+        if epoch % resample_data == 0: 
+            X = np.random.normal(size=(dataset_size, repin(Ghat).size()))
+        else:
+            np.random.shuffle(X)
 
-    #fig, ((ax_model_loss, ax_null_loss), (ax_learned, ax_true)) = plt.subplots(2,2)
-    fig, (ax_model_loss, ax_equivariance_loss, ax_generator_loss, ax_proj_loss) = plt.subplots(1,4)
+        if epoch % resample_W == 0:
+            W = get_equivariant_W()
+            f = map_from_matrix(W)
+            if reset_model_on_resample:
+                weight_vars.assign([objax.random.normal(var.shape) for var in weight_vars.tensors()])
     
-    ax_model_loss.plot(np.arange(epochs), model_losses)
-    ax_model_loss.set_title("Model loss")
+        for batch_type in batch_types:
+            for i in trange(num_batches[batch_type], desc=f"{batch_type} batches", leave=False):
+                x = X[batch_size * i : batch_size * (i+1)]
+                y = f(x)
+                _, training_losses = train_ops[batch_type](x, y, lr)
 
-    ax_equivariance_loss.plot(np.arange(epochs), equivariance_losses)
-    ax_equivariance_loss.set_title("Equivariance loss")
+                # Update losses dictionary
+                for loss_name, loss_value in training_losses.items():
+                    losses[loss_name].append((batch_idx, loss_value))
 
-    ax_generator_loss.plot(np.arange(epochs), generator_losses)
-    ax_generator_loss.set_title("Generator loss")
+                batch_idx += 1
 
-    ax_proj_loss.plot(np.arange(epochs), projection_losses)
-    ax_proj_loss.set_title("Projection loss")
+        x_val = np.random.normal(size=(num_val_batches * batch_size, repin(Ghat).size()))
+        y_val = f(x_val)
+        losses["/prediction/val"].append((batch_idx, loss(x_val, y_val)[1]["/prediction/train"]))
+    print()
 
-    #ax_learned.plot(np.arange(epochs), equivariance_errors_learned)
-    #ax_learned.set_title("Leanred equivariance error")
-
-    #ax_true.plot(np.arange(epochs), equivariance_errors_true)
-    #ax_true.set_title("True equivariance error")
-    
-    plt.show()
-
+    ##### Plot info #####
     print_layer_info(model, Ghat)
+    print()
+
+    print(f"True W:\n{W}\n")
+    print(f"W Ghat equivariance loss: {equivariance_loss(Ghat, repin, repout, W, ord=ord)}")
+    print()
 
     print(f"Ghat discrete generators:\n{Ghat.discrete_generators}")
     print(f"Ghat Lie generators:\n{Ghat.lie_algebra}")
-    
 
-def print_layer_info(model, Ghat):
-    for l in range(num_layers+1):
+    plot_info(losses, len(model.network))
+    assert False # for debugger
+
+def plot_info(losses, num_layers):
+
+    prefixes = {name.split('/')[0] for name in losses}
+    non_layer_prefixes = {prefix for prefix in prefixes if "layer" not in prefix}
+    prefix_to_row = {prefix: i for i,prefix in enumerate(non_layer_prefixes)}
+    prefix_to_row.update( {f"layer {l}": l+len(non_layer_prefixes) for l in range(num_layers)} )
+    type_to_col = {loss_type: idx for idx,loss_type in enumerate({name.split('/')[1] for name in losses})}
+    
+    fig, axes = plt.subplots(len(prefix_to_row), len(type_to_col))
+
+    for loss_name, loss_list in losses.items():
+        prefix, loss_type, label = loss_name.split('/')
+        row = prefix_to_row[prefix]
+        col = type_to_col[loss_type]
+        ax = axes[row][col]
+        xs, ys = zip(*loss_list)
+        ax.plot(xs, ys, label=label, alpha=0.8)
+        ax.legend()
+        if row == 0: ax.set_title(loss_type)
+        if col == 0: ax.set_ylabel(prefix)
+
+    plt.show()
+
+def print_layer_info(model, Ghat, print_reps=False):
+    print("########## Layer info ##########")
+    L = len(model.network)
+    for l in range(L):
         print(f"===== Layer {l} =====")
-        linear = model.network[l].linear if l < num_layers else model.network[l]
-        print(f"layer Ghat equivariance loss = {linear.equivariance_loss(Ghat)}")
-        print(f"layer G equivariance loss = {linear.equivariance_loss(G)}")
-        #print(f"projection loss = {linear.projection_loss()}")
+        linear = model.network[l].linear if l < L - 1 else model.network[l]
+        print(f"layer Ghat equivariance loss = {linear.equivariance_loss(Ghat, ord=ord)}")
+        print(f"layer G equivariance loss = {linear.equivariance_loss(G, ord=ord)}")
+        if reg_proj > 0:
+            print(f"projection loss = {linear.projection_loss()}")
         print()
 
         print(f"repin: {linear.repin}")
-        for h in Ghat.discrete_generators:
-            print(f"discrete generator rep:\n{linear.repin(G).rho_dense(h)}")
-        for A in Ghat.lie_algebra:
-            print(f"Lie generator rep:\n{linear.repin(G).drho_dense(A)}")
-        print()
+        if print_reps:
+            for h in Ghat.discrete_generators:
+                print(f"discrete generator rep:\n{linear.repin.rho_dense(h)}")
+            for A in Ghat.lie_algebra:
+                print(f"Lie generator rep:\n{linear.repin.drho_dense(A)}")
+            print()
 
         print(f"repout: {linear.repout}")
-        for h in Ghat.discrete_generators:
-            print(f"discrete generator rep:\n{linear.repout(G).rho_dense(h)}")
-        for A in Ghat.lie_algebra:
-            print(f"Lie generator rep:\n{linear.repout(G).drho_dense(A)}")
+        if print_reps:
+            for h in Ghat.discrete_generators:
+                print(f"discrete generator rep:\n{linear.repout.rho_dense(h)}")
+            for A in Ghat.lie_algebra:
+                print(f"Lie generator rep:\n{linear.repout.drho_dense(A)}")
         print()
 
         print(f"b:\n{linear.b}")
+        Ghat_err = equivariance_loss(Ghat, linear.repin, linear.repout, b=linear.b, ord=ord)
+        print(f"bhat Ghat equivariance loss: {Ghat_err}")
+        G_err = equivariance_loss(G, linear.repin, linear.repout, b=linear.b, ord=ord)
+        print(f"bhat G equivariance loss: {G_err}")
         print()
 
         print(f"rep_W: {linear.rep_W}")
-        for h in Ghat.discrete_generators:
-            print(f"discrete generator rep:\n{linear.rep_W(G).rho_dense(h)}")
-        for A in Ghat.lie_algebra:
-            print(f"Lie generator rep:\n{linear.rep_W(G).drho_dense(A)}")
+        if print_reps:
+            for h in Ghat.discrete_generators:
+                print(f"discrete generator rep:\n{linear.rep_W.rho_dense(h)}")
+            for A in Ghat.lie_algebra:
+                print(f"Lie generator rep:\n{linear.rep_W.drho_dense(A)}")
         print()
 
         print(f"W: {linear.repin} to {linear.repout}\n{linear.W}")
         print()
 
-        Ghat_err = equivariance_error(linear.W, linear.repin(Ghat), linear.repout(Ghat), Ghat)
-        print(f"What Ghat equivariance error: {Ghat_err}")
-        G_err = equivariance_error(linear.W, linear.repin(G), linear.repout(G), G)
-        print(f"What G equivariance error: {G_err}")
+        Ghat_err = equivariance_loss(Ghat, linear.repin, linear.repout, linear.W, ord=ord)
+        print(f"What Ghat equivariance loss: {Ghat_err}")
+        G_err = equivariance_loss(G, linear.repin, linear.repout, linear.W, ord=ord)
+        print(f"What G equivariance loss: {G_err}")
         print()
 
-    Ghat_err = equivariance_error(W, repin(Ghat), repout(Ghat), Ghat)
-    print(f"W Ghat equivariance error: {Ghat_err}")
-    G_err = equivariance_error(W, repin(G), repout(G), G)
-    print(f"W G equivariance error: {G_err}")
-    print(f"W Ghat equivariance loss: {equivariance_loss(Ghat, repin, repout, W)}")
-    print(f"W G equivariance loss: {equivariance_loss(G, repin, repout, W)}")
-    print()
+    print("################################")
 
 
 if __name__ == "__main__":

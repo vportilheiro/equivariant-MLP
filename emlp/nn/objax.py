@@ -21,23 +21,36 @@ from objax.nn.init import orthogonal
 from scipy.special import binom
 from jax import jit,vmap
 from functools import lru_cache as cache
+from collections import defaultdict
 
 def Sequential(*args):
     """ Wrapped to mimic pytorch syntax"""
     return nn.Sequential(args)
 
 @export
+class Network(Module):
+    def __init__(self, G, layers):
+        self.G = G
+        self.network = Sequential(*layers)
+    def __call__(self,x):
+        return self.network(x)
+
+@export
 class Linear(Module):
     """ Basic equivariant Linear layer from repin to repout."""
-    def __init__(self, repin, repout):
+    def __init__(self, repin, repout, use_bias=True):
         self.repin, self.repout = repin, repout
         nin,nout = repin.size(),repout.size()
+        self.use_bias = use_bias
         #super().__init__(nin,nout)
         self.rep_W = rep_W = repout*repin.T
         self.rep_bias = rep_bias = repout
 
         self.W_pre_proj = TrainVar(orthogonal((nout, nin)))
-        self.b_pre_proj = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+        if use_bias:
+            self.b_pre_proj = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+        else:
+            self.b_pre_proj = jnp.zeros((nout,))
 
         self.Pw = rep_W.equivariant_projector()
         self.Pb = rep_bias.equivariant_projector()
@@ -68,22 +81,70 @@ class Linear(Module):
 
 @export
 class ProjectionRecomputingLinear(Linear):
-    def __init__(self, repin, repout, sv_weight_func=None):
+    """ A linear layer which recomputes the projectors Pw and Pb on each access to W and b respectively.
+        Note that Pw and Pb are computed using the "approximately_equivariant" method. This method
+        takes a "singular value weight function" (sv_weight_func) and then projects onto the right
+        singular vectors of the constraint matrix, scaled by this weight function. (See for example
+        how the RankK subclass projects using the k smallest singular values.) This layer stores
+        the singular values and weights as values (tuples) sv_w_dict, whose keys are the representations
+        for which these values are calculated --- which will be either rep_W or rep_bias (or sub-reps 
+        thereof). The projection_loss() measures how far away the projections are from actually
+        projecting onto the null-spaces of the contraints. (High weights should only be given
+        to small singular values.)
+        Note: the sv_offset parameter is used to specify a small value by which to offset the contraint
+        matrix in order to keep it well conditioned. Otherwise, backprop through SVD gives NaNs. NaNs
+        may still appear, and currently the best guess is because this doesn't totally fix the bad
+        conditioning. (See the usage of the offset parameter in Rep.approximate_equivariant_basis().)
+
+        The layer also allows for defining a "singular value loss", which imposes an inductive bias
+        on the singular values themselves. For examples, having a loss function lambda S: jnp.sum(S) is
+        a particular way of penalizing large singular values. Note however that it may be desireable to
+        penalize singular values for different representations differently. For example, if we consider
+        the group SO(2), a vector is invariant iff is it the zero vector, while an equivariant linear
+        map can be any rotation. Thus if repin=repout=V, rep_bias should have all large singular values,
+        while rep_W should have some zero singular values. This illustrates that penalizing singular
+        values equally across all representations may be suboptimal (in fact in this case it leads
+        to the learned symmetry being trival).
+
+        We thus have a sv_loss_dict parameter, which we use to initialize a defaultdict, from representation
+        to loss function. If a representation isn't in the passed parameter, the sv_loss_func is used.
+        """
+    #TODO(?): implement a similar system for different sv_weight_funcs across different representations
+    def __init__(self, repin, repout, sv_weight_func=None, sv_offset=1e-4,
+                 sv_loss_func=None, sv_loss_dict=None, **kwargs):
+        # Parameters dealing with projection
         self.sv_weight_func = sv_weight_func
+        self.sv_offset = sv_offset
+
         self.sv_w_dict = {}
-        super().__init__(repin,repout)
+
+        # Parameters for expressing inductive biases about singular values
+        self.sv_loss_func = sv_loss_func
+        self.sv_loss_dict = defaultdict(lambda: lambda S: self.sv_loss_func(S)) # Note: the extra lambda is not a mistake
+        if sv_loss_dict is not None:
+            self.sv_loss_dict.update(sv_loss_dict)
+        super().__init__(repin,repout,**kwargs)
 
     @property
     def W(self):
-        self.Pw, sv_w_W = self.rep_W.approximately_equivariant_projector(self.sv_weight_func, return_sv=True)
+        self.Pw, sv_w_W = self.rep_W.approximately_equivariant_projector(self.sv_weight_func, return_sv=True, offset=self.sv_offset)
         self.sv_w_dict.update(sv_w_W)
         return super().W
 
     @property
     def b(self):
-        self.Pb, sv_w_b = self.rep_bias.approximately_equivariant_projector(self.sv_weight_func, return_sv=True)
-        self.sv_w_dict.update(sv_w_b)
+        # We will not calculate any projectors or losses for the bias if use_bias=False
+        if self.use_bias:
+            self.Pb, sv_w_b = self.rep_bias.approximately_equivariant_projector(self.sv_weight_func, return_sv=True, offset=self.sv_offset)
+            self.sv_w_dict.update(sv_w_b)
         return super().b
+
+    def projection_loss(self):
+        return sum((S*proj_weight) @ (S*proj_weight) for (S,proj_weight) in self.sv_w_dict.values())
+
+    def sv_loss(self):
+        return sum(self.sv_loss_dict[rep](S) for rep,(S,_) in self.sv_w_dict.items())
+
 
 @export
 class NoOptProjectionRecomputingLinear(Linear):
@@ -91,10 +152,10 @@ class NoOptProjectionRecomputingLinear(Linear):
         SVD decomposition across sum/product representations, instead solving the whole constraint
         across all the representations directly.
         NOTE: currently does not work, since SumReps do not have a self.G """
-    def __init__(self, repin, repout, sv_weight_func=None):
+    def __init__(self, repin, repout, sv_weight_func=None, **kwargs):
         self.sv_weight_func = sv_weight_func
         self.sv_w_dict = {}
-        super().__init__(repin,repout)
+        super().__init__(repin,repout, **kwargs)
 
     @property
     def W(self):
@@ -109,16 +170,35 @@ class NoOptProjectionRecomputingLinear(Linear):
         return super().b
 
 @export
+def RankKLinear(k, **kwargs_outer):
+    return lambda repin, repout, **kwargs: RankK(repin, repout, k, **{**kwargs, **kwargs_outer})
+class RankK(ProjectionRecomputingLinear):
+    def __init__(self, repin, repout, k, **kwargs):
+        super().__init__(repin, repout, \
+                lambda S: jax.lax.dynamic_update_slice(jnp.zeros_like(S), jnp.ones(k), [-k]),
+                **kwargs)
+
+@export
+def SoftSVDLinear(cutoff, **kwargs_outer):
+    return lambda repin, repout, **kwargs: SoftSVD(repin, repout, cutoff, **{**kwargs, **kwargs_outer})
+class SoftSVD(ProjectionRecomputingLinear):
+    def __init__(self, repin, repout, cutoff, **kwargs):
+        super().__init__(repin, repout, \
+                lambda S: jnp.exp(-0.5 * S**2 / (cutoff/3)**2),
+                **kwargs)
+
+@export
 class ApproximatingLinear(objax.Module):
     """ A vanilla linear layer from repin to repout which knows how to calculate
         an "approximate equivariance loss". """
-    def __init__(self, repin, repout):
+    def __init__(self, repin, repout, use_bias=True):
         self.repin, self.repout = repin, repout
+        self.use_bias = use_bias
         self.rep_W, self.rep_bias = (repin >> repout), repout
         nin,nout = repin.size(),repout.size()
         #super().__init__(nin,nout)
         self._W = TrainVar(orthogonal((nout, nin)))
-        self._b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
+        if use_bias: self._b = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
 
     def __call__(self, x):
         return x @ self.W.T + self.b
@@ -129,7 +209,9 @@ class ApproximatingLinear(objax.Module):
 
     @property
     def b(self):
-        return self._b.value
+        if self.use_bias:
+            return self._b.value
+        return jnp.zeros((self.repout.size(),))
     
     def equivariance_loss(self,G,ord=2):
         return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord)
@@ -169,7 +251,9 @@ class GatedNonlinearity(Module): #TODO: add support for mixed tensors and non su
         self.rep=rep
     def __call__(self,values):
         gate_scalars = values[..., gate_indices(self.rep)]
-        activations = jax.nn.sigmoid(gate_scalars) * values[..., :self.rep.size()]
+        #activations = jax.nn.sigmoid(gate_scalars) * values[..., :self.rep.size()]
+        # XXX TODO NOTE: undo this change
+        activations = jnp.exp(gate_scalars) * values[..., :self.rep.size()]
         return activations
 
 @export
@@ -270,6 +354,7 @@ class EMLP(Module,metaclass=Named):
         self.rep_out = rep_out(group)
         
         self.G=group
+        self.num_generators = len(group.discrete_generators) + len(group.lie_algebra)
         # Parse ch as a single int, a sequence of ints, a single Rep, a sequence of Reps
         if isinstance(ch,int): middle_layers = num_layers*[uniform_rep(ch,group)]#[uniform_rep(ch,group) for _ in range(num_layers)]
         elif isinstance(ch,Rep): middle_layers = num_layers*[ch(group)]
@@ -283,6 +368,31 @@ class EMLP(Module,metaclass=Named):
         )
     def __call__(self,x,training=True):
         return self.network(x)
+
+    def equivariance_loss(self, G=None, ord=2):
+        L = len(self.network)
+        if G is None:
+            G = self.G
+            num_generators = self.num_generators
+        else:
+            num_generators = len(G.discrete_generators) + len(G.lie_algebra)
+        eq_loss = 0
+        for l, layer in enumerate(self.network):
+            if l < L - 1: linear = layer.linear
+            else: linear = layer
+            eq_loss += linear.equivariance_loss(G, ord=ord) / (L * num_generators) 
+        return eq_loss
+
+    def parameter_norm_sum(self, ord=2):
+        L = len(self.network)
+        norm_sum = 0
+        for l, layer in enumerate(self.network):
+            if l < L - 1: linear = layer.linear
+            else: linear = layer
+            norm_sum += jnp.linalg.norm(linear.W, ord=ord) / L
+            norm_sum += jnp.linalg.norm(linear.b, ord=ord) / L
+        return norm_sum
+
 
 def swish(x):
     return jax.nn.sigmoid(x)*x

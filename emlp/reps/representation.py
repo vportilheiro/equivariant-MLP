@@ -84,14 +84,14 @@ class Rep(object):
         """ A convenience function which returns drho(A) as a dense matrix."""
         return densify(self.drho(A))
     
-    def constraint_matrix(self):
+    def constraint_matrix(self,offset=0):
         """ Constructs the equivariance constrant matrix (lazily) by concatenating
         the constraints (ρ(hᵢ)-I) for i=1,...M and dρ(Aₖ) for k=1,..,D from the generators
         of the symmetry group. """
         n = self.size()
         constraints = []
-        constraints.extend([lazify(self.rho(h))-I(n) for h in self.G.discrete_generators])
-        constraints.extend([lazify(self.drho(A)) for A in self.G.lie_algebra])
+        constraints.extend([lazify(self.rho(h))-I(n)+offset*I(n) for h in self.G.discrete_generators])
+        constraints.extend([lazify(self.drho(A))+offset*I(n) for A in self.G.lie_algebra])
         return ConcatLazy(constraints) if constraints else lazify(jnp.zeros((1,n)))
 
     solcache = {} 
@@ -121,7 +121,7 @@ class Rep(object):
         P = Q_lazy@Q_lazy.H
         return P
 
-    def approximately_equivariant_basis(self, sv_weight_func=None, return_sv=False):
+    def approximately_equivariant_basis(self, sv_weight_func=None, return_sv=False, offset=0):
         """ Computes the approximately equivariant basis by using a multiplicative mask/weight,
             applied to the singular values of the contraint matrix to select the right singular vectors.
             This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
@@ -133,32 +133,32 @@ class Rep(object):
             if return_sv:
                 return jnp.ones((1,1)), {self: (jnp.zeros(1), jnp.ones(1))}
             return jnp.ones((1,1))
-        logging.info(f"Solving projector for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
+        logging.info(f"Solving approximate basis for {self}"+(f", for G={self.G}" if hasattr(self,"G") else ""))
         #if isinstance(group,Trivial): return np.eye(size(rank,group.d))
-        C_lazy = self.constraint_matrix()
+        C_lazy = self.constraint_matrix(offset=offset)
         C_dense = C_lazy.to_dense()
         U,S,VH = jnp.linalg.svd(C_dense,full_matrices=False)
-        logging.info(f"C:\n{C_dense}\nU:\n{U}\nS:{S}\nV:\n{V}")
+        logging.info(f"C:\n{C_dense}\nU:\n{U}\nS:{S}\nVH:\n{VH}")
 
         # Mask out rows of VH for which the singular values are small
         if sv_weight_func is None:
             sv_weight_func = lambda S: S<1e-5
-        S_mask = sv_weight_func(S)
-        Q = (S_mask[:, np.newaxis] * VH).conj().T # projector onto null-space
+        S_weight = sv_weight_func(S)
+        Q = (S_weight[:, np.newaxis] * VH).conj().T # projector onto null-space
         if return_sv:
-            return Q, {self: (S, S_mask)}
+            return Q, {self: (S, S_weight)}
         return Q
 
-    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False):
+    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False, offset=0):
         """ Computes the equivariant projector by using a multiplicative mask.
             This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
             not able to take derivatives. 
             NOTE: In a formalizable sense, most matrices C_dense will have all non-zero singular
             values, making the returned projector the zero matrix. """
         if return_sv:
-            Q, sv_w_dict = self.approximately_equivariant_basis(sv_weight_func, return_sv)
+            Q, sv_w_dict = self.approximately_equivariant_basis(sv_weight_func, return_sv, offset=offset)
         else:
-            Q = self.approximately_equivariant_basis(sv_weight_func, return_sv)
+            Q = self.approximately_equivariant_basis(sv_weight_func, return_sv, offset=offset)
 
         Q_lazy = lazify(Q)
         Proj = Q_lazy @ Q_lazy.H
