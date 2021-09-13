@@ -251,9 +251,9 @@ class GatedNonlinearity(Module): #TODO: add support for mixed tensors and non su
         self.rep=rep
     def __call__(self,values):
         gate_scalars = values[..., gate_indices(self.rep)]
-        #activations = jax.nn.sigmoid(gate_scalars) * values[..., :self.rep.size()]
+        activations = jax.nn.sigmoid(gate_scalars) * values[..., :self.rep.size()]
         # XXX TODO NOTE: undo this change
-        activations = jnp.exp(gate_scalars) * values[..., :self.rep.size()]
+        #activations = jnp.exp(gate_scalars) * values[..., :self.rep.size()]
         return activations
 
 @export

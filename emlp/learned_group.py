@@ -47,9 +47,9 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
             loss += norm_sq
 
     for A in G.lie_algebra:
-        A_out = repout.rho_dense(A)
+        A_out = repout.drho_dense(A)
         if W is not None:
-            A_in = repin.rho_dense(A)
+            A_in = repin.drho_dense(A)
             norm = jnp.linalg.norm(A_out @ W - W @ A_in, ord=ord)
             if normalize:
                 norm = norm / (jnp.linalg.norm(W, ord=ord) + jnp.linalg.norm(A_in, ord=ord) + jnp.linalg.norm(A_out, ord=ord))
@@ -62,6 +62,27 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
             if normalize:
                 norm_sq = norm_sq / (b @ b + jnp.linalg.norm(A_out, ord=ord)**2)
             loss += norm_sq
+    return loss
+
+def data_fhat_equivariance_loss(G, repin, repout, x, y, fhat, ord=2):
+    if (not hasattr(repin, "G")) or repin.G is None:
+        repin = repin(G)
+    if (not hasattr(repout, "G")) or repout.G is None:
+        repout = repout(G)
+    loss = 0
+    for h in G.discrete_generators:
+        H_in = repin.rho_dense(h)
+        H_out = repout.rho_dense(h)
+        loss += jnp.linalg.norm(
+                (H_out @ y[...,jnp.newaxis]).squeeze() - fhat((H_in @ x[...,jnp.newaxis]).squeeze()), 
+                ord=ord, axis=-1).mean()
+
+    for A in G.lie_algebra:
+        A_in = repin.drho_dense(A)
+        A_out = repout.drho_dense(A)
+        #loss += (y @ A_out.T - fhat(x @ A_in.T)).mean()
+        loss += jnp.linalg.norm((A_out @ y[...,jnp.newaxis]).squeeze() - fhat((A_in @ x[...,jnp.newaxis]).squeeze()), ord=ord, axis=-1).mean()
+
     return loss
 
 def generator_loss(G, ord=2):

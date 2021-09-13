@@ -9,7 +9,7 @@ import logging
 logging.basicConfig(filename='experiment.log', encoding='utf-8', level=logging.INFO)
 
 import emlp
-from emlp.learned_group import LearnedGroup, equivariance_loss, generator_loss
+from emlp.learned_group import LearnedGroup, equivariance_loss, generator_loss, data_fhat_equivariance_loss
 from emlp.groups import S, Z, SO, O, Trivial
 from emlp.reps import V, equivariance_error
 import emlp.nn as nn
@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from tqdm.auto import tqdm, trange
 
 # TODO: why does svd lead to multiple copies of/same generators?
+# TODO: why does using drho in equivariance loss learn more slowly that rho? (Replacing all drho with rho learns symmetries better?)
 # NOTE: check "normalize" option in equivariance_loss
 
 ##### Debuggin options #####
@@ -31,27 +32,31 @@ from jax.config import config
 config.update("jax_debug_nans", True) # For tracing where NaNs come from
 config.update('jax_disable_jit', False) # For examining values inside functions
 
+#objax.random.DEFAULT_GENERATOR.seed(0)
+
 ##### Training hyperparameters #####
 
-reg_eq = 0.3        # regularization parameter: how much to weight equivariance loss 
+reg_eq = 0.2        # regularization parameter: how much to weight equivariance loss 
+reg_data_eq = 0.2 # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
 reg_gen = 0.0 #1e-8 # regularization parameter: how much to weight generator loss
 reg_proj = 0.00     # regularization parameter: how much to weight projection loss
 reg_sv = 0.00       # how much to weight loss from singular values
 lr = 1e-4
-epochs = 4*40000
+epochs = 20000
 
 # We define the dataset size by the number of batches and batch size.
 # We have different kinds of batches: "all" for those used to update all parameters,
 # "weights" for those updating only model weights, "gen" for updating only Ghat's generators.
-batch_size = 8
+batch_size = 64
 dataset_size = 1 * batch_size 
 batch_types = ["all", "weights", "gen"] # each epoch trains in this order
 num_batches = {"all": 10000, "weights": 0, "gen": 0}
 num_batches = {batch_type: min(num, dataset_size//batch_size) for batch_type, num in num_batches.items()}
 num_val_batches = 1     # Used for validation every epoch. Currently, validation data is resampled each epoch.
 
-resample_data = 40000          # How many epochs before a new dataset is sampled
-resample_W = 40000             # How many epochs before a new W is sampled
+# NOTE: to never resample, the numbers below can be set to np.inf
+resample_data = np.inf          # How many epochs before a new dataset is sampled
+resample_W = np.inf             # How many epochs before a new W is sampled
 reset_model_on_resample = True  # If true, the model weights are re-initialized on each resample of W
 
 # Order of the matrix norm to use in losses
@@ -63,8 +68,8 @@ channels = V**0 + V
 
 ##### Task setup #####
 
-n = 2
-G = SO(n)
+n = 3
+G = S(n)
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
 repin = V 
@@ -96,11 +101,11 @@ def main():
     #Ghat = Trivial(n)
     ngenerators = ncontinuous + ndiscrete
 
-    #model = nn.EMLP(repin, repout, \
-    #        #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
-    #        LinearLayer=nn.ApproximatingLinear,
-    #        group=Ghat, num_layers=num_layers, ch=channels)
-    model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=True)])
+    model = nn.EMLP(repin, repout, \
+            #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
+            LinearLayer=nn.ApproximatingLinear,
+            group=Ghat, num_layers=num_layers, ch=channels)
+    #model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=True)])
     #model = nn.Network(Ghat, [
     #    nn.SoftSVDLinear(1, use_bias=True,
     #                    sv_offset=1e-4,
@@ -137,6 +142,11 @@ def main():
         return {"/non-triviality/Ghat": result / ngenerators}
 
     @objax.Jit
+    @objax.Function.with_vars(weight_vars)
+    def cross_G_val(x_val):
+        return data_fhat_equivariance_loss(G, repin, repout, x_val, model(x_val), model, ord=ord)
+
+    @objax.Jit
     @objax.Function.with_vars(all_vars)
     def loss(x, y):
         yhat = model(x)
@@ -167,13 +177,15 @@ def main():
             if reg_sv > 0:
                 losses["/svd/sv"] += linear.sv_loss() / L
 
+        d = losses["/equivariance/cross-Ghat"] = data_fhat_equivariance_loss(Ghat, repin, repout, x, y, model, ord=ord)
+        #losses["/equivariance/cross-G"] = data_fhat_equivariance_loss(G, repin, repout, x, yhat, model, ord=ord)
         losses["/prediction/train"] = ((yhat-y)**2).mean()
         losses["/norm/generators"] = generator_loss(Ghat, ord) / ngenerators
         p = losses["/svd/proj"] if reg_proj > 0 else 0
         s = losses["/svd/sv"] if reg_sv > 0 else 0
         m, e, g = losses["/prediction/train"], losses["/equivariance/model-Ghat"], \
                      losses["/norm/generators"]
-        return ((1-reg_eq-reg_gen-reg_proj-reg_sv)*m+ reg_eq*e + reg_gen*g + reg_proj*p + reg_sv*s), losses
+        return ((1-reg_eq-reg_data_eq-reg_gen-reg_proj-reg_sv)*m+ reg_eq*e + reg_data_eq*d + reg_gen*g + reg_proj*p + reg_sv*s), losses
 
     @objax.Jit
     @objax.Function.with_vars(all_vars)
@@ -216,20 +228,24 @@ def main():
     print(f"True G: {G}")
     print(f"repin: {repin}, repout: {repout}")
     print(f"equivariant space rank: {equivariant_space_rank()}")
-    if not resample_W: print(f"True W:\n{W}\n")
-    else: print("True W: resampled every epoch (resample_W=True)")
+    print()
+
+    if resample_W < epochs:
+        print(f"True W matrix is resampled every {resample_W} epochs")
+        if reset_model_on_resample: 
+            print(f"Note: reset_model_on_resample=True, so the resamples of W trigger model weight re-initialization")
+    else:
+        print(f"True W:\n{W}")
+    print()
+
     print(f"Initial Ghat discrete generators:\n{Ghat.discrete_generators}")
     print(f"Initial Ghat Lie generators:\n{Ghat.lie_algebra}")
     print()
 
     print(f"Dataset size: {dataset_size}")
     print(f"Effective dataset size (size * epochs): {epochs * dataset_size}")
-    if resample_data < np.inf:
+    if resample_data < epochs:
         print(f"Input datapoints are resampled every {resample_data} epochs")
-    if resample_W < np.inf:
-        print(f"True W matrix is resampled every {resample_W} epochs")
-        if reset_model_on_resample: 
-            print(f"Note: reset_model_on_resample=True, so the resamples of W trigger model weight re-initialization")
 
     ##### Training loop #####
 
@@ -262,6 +278,7 @@ def main():
         x_val = np.random.normal(size=(num_val_batches * batch_size, repin(Ghat).size()))
         y_val = f(x_val)
         losses["/prediction/val"].append((batch_idx, loss(x_val, y_val)[1]["/prediction/train"]))
+        losses["/equivariance/cross-G-val"].append((batch_idx, cross_G_val(x_val)))
     print()
 
     ##### Plot info #####
