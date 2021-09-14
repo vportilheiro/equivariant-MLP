@@ -36,13 +36,13 @@ config.update('jax_disable_jit', False) # For examining values inside functions
 
 ##### Training hyperparameters #####
 
-reg_eq = 0.2        # regularization parameter: how much to weight equivariance loss 
-reg_data_eq = 0.2 # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
+reg_eq = 0.0        # regularization parameter: how much to weight equivariance loss 
+reg_data_eq = 0.0 # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
 reg_gen = 0.0 #1e-8 # regularization parameter: how much to weight generator loss
-reg_proj = 0.00     # regularization parameter: how much to weight projection loss
-reg_sv = 0.00       # how much to weight loss from singular values
+reg_proj = 0.25     # regularization parameter: how much to weight projection loss
+reg_sv = 0.25       # how much to weight loss from singular values
 lr = 1e-4
-epochs = 20000
+epochs = 40000
 
 # We define the dataset size by the number of batches and batch size.
 # We have different kinds of batches: "all" for those used to update all parameters,
@@ -102,10 +102,10 @@ def main():
     ngenerators = ncontinuous + ndiscrete
 
     model = nn.EMLP(repin, repout, \
-            #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
-            LinearLayer=nn.ApproximatingLinear,
+            LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
+            #LinearLayer=nn.ApproximatingLinear,
             group=Ghat, num_layers=num_layers, ch=channels)
-    #model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=True)])
+    #model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=False)])
     #model = nn.Network(Ghat, [
     #    nn.SoftSVDLinear(1, use_bias=True,
     #                    sv_offset=1e-4,
