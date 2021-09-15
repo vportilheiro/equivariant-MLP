@@ -36,13 +36,13 @@ config.update('jax_disable_jit', False) # For examining values inside functions
 
 ##### Training hyperparameters #####
 
-reg_eq = 0.0        # regularization parameter: how much to weight equivariance loss 
+reg_eq = 0.1        # regularization parameter: how much to weight equivariance loss 
 reg_data_eq = 0.0 # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
 reg_gen = 0.0 #1e-8 # regularization parameter: how much to weight generator loss
-reg_proj = 0.25     # regularization parameter: how much to weight projection loss
-reg_sv = 0.25       # how much to weight loss from singular values
+reg_proj = 0.0     # regularization parameter: how much to weight projection loss
+reg_sv = 0.0       # how much to weight loss from singular values
 lr = 1e-4
-epochs = 40000
+epochs = 20000
 
 # We define the dataset size by the number of batches and batch size.
 # We have different kinds of batches: "all" for those used to update all parameters,
@@ -55,7 +55,7 @@ num_batches = {batch_type: min(num, dataset_size//batch_size) for batch_type, nu
 num_val_batches = 1     # Used for validation every epoch. Currently, validation data is resampled each epoch.
 
 # NOTE: to never resample, the numbers below can be set to np.inf
-resample_data = np.inf          # How many epochs before a new dataset is sampled
+resample_data = 1          # How many epochs before a new dataset is sampled
 resample_W = np.inf             # How many epochs before a new W is sampled
 reset_model_on_resample = True  # If true, the model weights are re-initialized on each resample of W
 
@@ -102,8 +102,8 @@ def main():
     ngenerators = ncontinuous + ndiscrete
 
     model = nn.EMLP(repin, repout, \
-            LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
-            #LinearLayer=nn.ApproximatingLinear,
+            #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
+            LinearLayer=nn.ApproximatingLinear,
             group=Ghat, num_layers=num_layers, ch=channels)
     #model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=False)])
     #model = nn.Network(Ghat, [
@@ -156,15 +156,13 @@ def main():
             if l < L - 1: linear = layer.linear
             else: linear = layer
             # Ghat equivariance
-            losses[f"layer {l}/equivariance/layer-Ghat"] = Ghat_eq = \
-                    linear.equivariance_loss(Ghat, ord=ord) / ngenerators
+            losses[f"layer {l}/equivariance/layer-Ghat"] = Ghat_eq = linear.equivariance_loss(Ghat, ord=ord)
             losses["/equivariance/model-Ghat"] += Ghat_eq / L
 
             # G equivariance
             # NOTE: do not use these losses for learning! They are for validation purposes only, as they
             # checks whether the model is equivariant under the unknown symmetry group G
-            losses[f"layer {l}/equivariance/layer-G"] = G_eq = \
-                    linear.equivariance_loss(G, ord=ord) / ngenerators
+            losses[f"layer {l}/equivariance/layer-G"] = G_eq = linear.equivariance_loss(G, ord=ord)
             losses["/equivariance/model-G"] += G_eq / L
 
             # weight norm
@@ -180,7 +178,7 @@ def main():
         d = losses["/equivariance/cross-Ghat"] = data_fhat_equivariance_loss(Ghat, repin, repout, x, y, model, ord=ord)
         #losses["/equivariance/cross-G"] = data_fhat_equivariance_loss(G, repin, repout, x, yhat, model, ord=ord)
         losses["/prediction/train"] = ((yhat-y)**2).mean()
-        losses["/norm/generators"] = generator_loss(Ghat, ord) / ngenerators
+        losses["/norm/generators"] = generator_loss(Ghat, ord)
         p = losses["/svd/proj"] if reg_proj > 0 else 0
         s = losses["/svd/sv"] if reg_sv > 0 else 0
         m, e, g = losses["/prediction/train"], losses["/equivariance/model-Ghat"], \

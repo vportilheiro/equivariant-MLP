@@ -62,7 +62,7 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
             if normalize:
                 norm_sq = norm_sq / (b @ b + jnp.linalg.norm(A_out, ord=ord)**2)
             loss += norm_sq
-    return loss
+    return loss / (len(G.discrete_generators) + len(G.lie_algebra))
 
 def data_fhat_equivariance_loss(G, repin, repout, x, y, fhat, ord=2):
     if (not hasattr(repin, "G")) or repin.G is None:
@@ -76,14 +76,12 @@ def data_fhat_equivariance_loss(G, repin, repout, x, y, fhat, ord=2):
         loss += jnp.linalg.norm(
                 (H_out @ y[...,jnp.newaxis]).squeeze() - fhat((H_in @ x[...,jnp.newaxis]).squeeze()), 
                 ord=ord, axis=-1).mean()
-
     for A in G.lie_algebra:
         A_in = repin.drho_dense(A)
         A_out = repout.drho_dense(A)
         #loss += (y @ A_out.T - fhat(x @ A_in.T)).mean()
         loss += jnp.linalg.norm((A_out @ y[...,jnp.newaxis]).squeeze() - fhat((A_in @ x[...,jnp.newaxis]).squeeze()), ord=ord, axis=-1).mean()
-
-    return loss
+    return loss / (len(G.discrete_generators) + len(G.lie_algebra))
 
 def generator_loss(G, ord=2):
         loss = 0
@@ -93,5 +91,4 @@ def generator_loss(G, ord=2):
             #loss -= jnp.linalg.norm(h - jnp.eye(h.shape[-1]), ord=ord)
         for A in G.lie_algebra:
             loss += jnp.linalg.norm(A, ord=ord)
-        return loss
-
+        return loss / (len(G.discrete_generators) + len(G.lie_algebra))
