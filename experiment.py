@@ -10,7 +10,7 @@ logging.basicConfig(filename='experiment.log', encoding='utf-8', level=logging.I
 
 import emlp
 from emlp.learned_group import LearnedGroup, equivariance_loss, generator_loss, data_fhat_equivariance_loss
-from emlp.groups import S, Z, SO, O, Trivial
+from emlp.groups import S, C, Z, SO, O, Trivial
 from emlp.reps import V, equivariance_error
 import emlp.nn as nn
 
@@ -23,26 +23,26 @@ import jax.numpy as jnp
 from tqdm.auto import tqdm, trange
 
 # TODO: why does svd lead to multiple copies of/same generators?
-# TODO: why does using drho in equivariance loss learn more slowly that rho? (Replacing all drho with rho learns symmetries better?)
+# TODO: why does using drho in equivariance loss learn more slowly than rho? (Replacing all drho with rho learns symmetries better?)
 # NOTE: check "normalize" option in equivariance_loss
 
 ##### Debuggin options #####
 
 from jax.config import config
-config.update("jax_debug_nans", True) # For tracing where NaNs come from
+config.update("jax_debug_nans", False) # For tracing where NaNs come from
 config.update('jax_disable_jit', False) # For examining values inside functions
 
-#objax.random.DEFAULT_GENERATOR.seed(0)
+objax.random.DEFAULT_GENERATOR.seed(np.random.randint(10000000000))
 
 ##### Training hyperparameters #####
 
-reg_eq = 0.1        # regularization parameter: how much to weight equivariance loss 
-reg_data_eq = 0.0 # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
-reg_gen = 0.0 #1e-8 # regularization parameter: how much to weight generator loss
-reg_proj = 0.0     # regularization parameter: how much to weight projection loss
-reg_sv = 0.0       # how much to weight loss from singular values
-lr = 1e-4
-epochs = 20000
+reg_eq = 0.0        # regularization parameter: how much to weight equivariance loss 
+reg_data_eq = 0.1   # regularization parameter: how much to weight ||Hhat f - f Hhat|| estimate
+reg_gen = 0.00      # regularization parameter: how much to weight generator loss
+reg_proj = 0.25     # regularization parameter: how much to weight projection loss
+reg_sv = 0.1       # how much to weight loss from singular values
+lr = 1e-1
+epochs = 1000
 
 # We define the dataset size by the number of batches and batch size.
 # We have different kinds of batches: "all" for those used to update all parameters,
@@ -55,7 +55,7 @@ num_batches = {batch_type: min(num, dataset_size//batch_size) for batch_type, nu
 num_val_batches = 1     # Used for validation every epoch. Currently, validation data is resampled each epoch.
 
 # NOTE: to never resample, the numbers below can be set to np.inf
-resample_data = 1          # How many epochs before a new dataset is sampled
+resample_data = np.inf          # How many epochs before a new dataset is sampled
 resample_W = np.inf             # How many epochs before a new W is sampled
 reset_model_on_resample = True  # If true, the model weights are re-initialized on each resample of W
 
@@ -69,7 +69,7 @@ channels = V**0 + V
 ##### Task setup #####
 
 n = 3
-G = S(n)
+G = Z(n)
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
 repin = V 
@@ -102,17 +102,22 @@ def main():
     ngenerators = ncontinuous + ndiscrete
 
     model = nn.EMLP(repin, repout, \
-            #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
-            LinearLayer=nn.ApproximatingLinear,
+            LinearLayer=nn.SoftSVDLinear(1, use_bias=False, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
+            #LinearLayer=nn.ApproximatingLinear,
+            #LinearLayer=nn.RankDictLinear(rank_dict={rep(Ghat): rep(G).equivariant_basis().shape[1] for rep in [(V**0), V, (V>>V)]}, use_bias=False),#rank_dict={V(Ghat): 2, (V**0)(Ghat): 1}, use_bias=True),
             group=Ghat, num_layers=num_layers, ch=channels)
     #model = nn.Network(Ghat, [nn.ApproximatingLinear(repin(Ghat), repout(Ghat), use_bias=False)])
-    #model = nn.Network(Ghat, [
-    #    nn.SoftSVDLinear(1, use_bias=True,
+    #model = nn.SimpleNetwork(Ghat, repin, repout,
+    #        num_layers = 1,
+    #        linear = nn.SoftSVDLinear(1, use_bias=False,
     #                    sv_offset=1e-4,
     #                    sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5)),
     #                    sv_loss_dict={V(Ghat) :(lambda S: 0), V: (lambda S:0)},
-    #                    )(repin(Ghat), repout(Ghat))
-    #    ])
+    #                    ),
+    #        #linear = nn.RankKLinear(2, rank_dict={V(Ghat): 2, (V**0)(Ghat): 1}, use_bias=True),
+    #        #linear = lambda repin, repout: nn.ApproximatingLinear(repin, repout, use_bias=False),
+    #        nonlinearity = objax.functional.relu
+    #    )
     #model = nn.Network(Ghat, [nn.RankKLinear(2, sv_loss_func=lambda S:0)(repin(Ghat), repout(Ghat), use_bias=False, sv_offset=1e-4)])
 
     all_vars = model.vars()
@@ -142,9 +147,9 @@ def main():
         return {"/non-triviality/Ghat": result / ngenerators}
 
     @objax.Jit
-    @objax.Function.with_vars(weight_vars)
+    @objax.Function.with_vars(all_vars)
     def cross_G_val(x_val):
-        return data_fhat_equivariance_loss(G, repin, repout, x_val, model(x_val), model, ord=ord)
+        return data_fhat_equivariance_loss(G, repin, repout, x_val, model(x_val), model)
 
     @objax.Jit
     @objax.Function.with_vars(all_vars)
@@ -175,8 +180,8 @@ def main():
             if reg_sv > 0:
                 losses["/svd/sv"] += linear.sv_loss() / L
 
-        d = losses["/equivariance/cross-Ghat"] = data_fhat_equivariance_loss(Ghat, repin, repout, x, y, model, ord=ord)
-        #losses["/equivariance/cross-G"] = data_fhat_equivariance_loss(G, repin, repout, x, yhat, model, ord=ord)
+        d = losses["/equivariance/cross-Ghat"] = data_fhat_equivariance_loss(Ghat, repin, repout, x, y, model)
+        #losses["/equivariance/cross-G"] = data_fhat_equivariance_loss(G, repin, repout, x, yhat, model)
         losses["/prediction/train"] = ((yhat-y)**2).mean()
         losses["/norm/generators"] = generator_loss(Ghat, ord)
         p = losses["/svd/proj"] if reg_proj > 0 else 0
@@ -249,7 +254,8 @@ def main():
 
     losses = defaultdict(list)
     batch_idx = 0 # time index of current training batch, for book-keeping
-    for epoch in trange(epochs, desc="epochs"):
+    X = np.random.normal(size=(dataset_size, repin(Ghat).size()))
+    for epoch in trange(1, epochs+1, desc="epochs"):
         if epoch % resample_data == 0: 
             X = np.random.normal(size=(dataset_size, repin(Ghat).size()))
         else:
@@ -291,7 +297,8 @@ def main():
     print(f"Ghat Lie generators:\n{Ghat.lie_algebra}")
 
     plot_info(losses, len(model.network))
-    assert False # for debugger
+    breakpoint()
+ 
 
 def plot_info(losses, num_layers):
 

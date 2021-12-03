@@ -121,7 +121,7 @@ class Rep(object):
         P = Q_lazy@Q_lazy.H
         return P
 
-    def approximately_equivariant_basis(self, sv_weight_func=None, return_sv=False, offset=0):
+    def approximately_equivariant_basis(self, sv_w_func_dict=None, return_sv=False, offset=0):
         """ Computes the approximately equivariant basis by using a multiplicative mask/weight,
             applied to the singular values of the contraint matrix to select the right singular vectors.
             This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
@@ -141,6 +141,7 @@ class Rep(object):
         logging.info(f"C:\n{C_dense}\nU:\n{U}\nS:{S}\nVH:\n{VH}")
 
         # Mask out rows of VH for which the singular values are small
+        sv_weight_func = sv_w_func_dict[self]
         if sv_weight_func is None:
             sv_weight_func = lambda S: S<1e-5
         S_weight = sv_weight_func(S)
@@ -149,16 +150,16 @@ class Rep(object):
             return Q, {self: (S, S_weight)}
         return Q
 
-    def approximately_equivariant_projector(self, sv_weight_func=None, return_sv=False, offset=0):
+    def approximately_equivariant_projector(self, sv_w_func_dict=None, return_sv=False, offset=0):
         """ Computes the equivariant projector by using a multiplicative mask.
             This avoids the use of jnp.linalg.svd with full_matrices=True, for which JAX is
             not able to take derivatives. 
             NOTE: In a formalizable sense, most matrices C_dense will have all non-zero singular
             values, making the returned projector the zero matrix. """
         if return_sv:
-            Q, sv_w_dict = self.approximately_equivariant_basis(sv_weight_func, return_sv, offset=offset)
+            Q, sv_w_dict = self.approximately_equivariant_basis(sv_w_func_dict, return_sv, offset=offset)
         else:
-            Q = self.approximately_equivariant_basis(sv_weight_func, return_sv, offset=offset)
+            Q = self.approximately_equivariant_basis(sv_w_func_dict, return_sv, offset=offset)
 
         Q_lazy = lazify(Q)
         Proj = Q_lazy @ Q_lazy.H

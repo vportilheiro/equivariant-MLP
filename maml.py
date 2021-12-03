@@ -21,27 +21,29 @@ from tqdm.auto import tqdm
 
 from jax.config import config
 # For tracing where NaNs come from
-config.update("jax_debug_nans", False)
+config.update("jax_debug_nans", True)
 # For examining values inside functions
 config.update('jax_disable_jit', False)
 
-reg_eq = 0.50 # regularization parameter: how much to weight equivariance loss 
+#objax.random.DEFAULT_GENERATOR.seed(np.random.randint(10000000000))
+
+reg_eq = 0.0 # regularization parameter: how much to weight equivariance loss 
 reg_gen = 0.0 #1e-8  # regularization parameter: how much to weight generator loss
-reg_proj = 0.0  # regularization parameter: how much to weight projection loss
+reg_proj = 0.25  # regularization parameter: how much to weight projection loss
 reg_sv = 0.0 # how much to weight loss from singular values
 
-outer_epochs = 10000
-inner_epochs = 10
-inner_batch_size = 64
+outer_epochs = 15000
+inner_epochs = 2
+inner_batch_size = 8
 outer_batch_size = 64
-inner_lr = 1e-4
-outer_lr = 1e-4
+inner_lr = 1e-1
+outer_lr = 1e-3
 
 # Order of the matrix norm to use in loses
 ord=2
 
-n=3
-G = S(n)
+n=2
+G = SO(n)
 ncontinuous = len(G.lie_algebra)
 ndiscrete = len(G.discrete_generators)
 repin = V(G)
@@ -73,8 +75,10 @@ def main():
     ngenerators = ncontinuous + ndiscrete
 
     model = nn.EMLP(repin, repout, \
+            #LinearLayer=nn.ProjectionRecomputingLinear,
             #LinearLayer=nn.SoftSVDLinear(1, sv_loss_func=lambda S: jnp.sum(jnp.tanh(S/5))), \
-            LinearLayer=nn.ApproximatingLinear,
+            LinearLayer=nn.RankDictLinear(rank_dict={rep(Ghat): rep(G).equivariant_basis().shape[1] for rep in [(V**0), V, (V>>V)]}, use_bias=False),#rank_dict={V(Ghat): 2, (V**0)(Ghat): 1}, use_bias=True),
+            #LinearLayer=nn.ApproximatingLinear,
             group=Ghat, num_layers=num_layers, ch=channels)
 
     all_vars = model.vars()
@@ -84,7 +88,7 @@ def main():
     print(f"group vars:\n{generator_vars}")
     print(f"non-group vars:\n{weight_vars}")
 
-    opt = objax.optimizer.Adam(model.vars())
+    opt = objax.optimizer.Adam(generator_vars)
 
     @objax.Jit
     #@objax.Function.with_vars(model.vars())
@@ -98,14 +102,14 @@ def main():
             else: linear = layer
             # Ghat equivariance
             losses[f"layer {l}/equivariance/layer-Ghat"] = Ghat_eq = \
-                    linear.equivariance_loss(Ghat, ord=ord) / ngenerators
+                    linear.equivariance_loss(Ghat, ord=ord, offset=1e-10) / ngenerators
             losses["/equivariance/model-Ghat"] += Ghat_eq / L
 
             # G equivariance
             # NOTE: do not use these losses for learning! They are for validation purposes only, as they
             # checks whether the model is equivariant under the unknown symmetry group G
             losses[f"layer {l}/equivariance/layer-G"] = G_eq = \
-                    linear.equivariance_loss(G, ord=ord) / ngenerators
+                    linear.equivariance_loss(G, ord=ord, offset=1e-10) / ngenerators
             losses["/equivariance/model-G"] += G_eq / L
 
             # weight norm
@@ -121,7 +125,8 @@ def main():
         losses["/prediction/train"] = ((Y_pred-Y)**2).mean()
         losses["/norm/generators"] = generator_loss(Ghat, ord) / ngenerators
         p = losses["/svd/proj"] if reg_proj > 0 else 0
-        s = losses["/svd/sv"] if reg_sv > 0 else 0
+        #s = losses["/svd/sv"] if reg_sv > 0 else 0
+        s=0
         m, e, g = losses["/prediction/train"], losses["/equivariance/model-Ghat"], \
                      losses["/norm/generators"]
         return ((1-reg_eq-reg_gen-reg_proj-reg_sv)*m+ reg_eq*e + reg_gen*g + reg_proj*p + reg_sv*s), losses
@@ -134,8 +139,8 @@ def main():
             inner_grad = inner_grad_and_val(X, Y)[0] 
             weight_vars.assign([weight - inner_lr * grad for weight,grad in zip(weight_vars.tensors(), inner_grad)])
 
-    @objax.Function.with_vars(model.vars())
-    #@objax.Function.with_vars(generator_vars)
+    #@objax.Function.with_vars(model.vars())
+    @objax.Function.with_vars(generator_vars)
     def outer_loss(X_train, Y_train, X_val, Y_val, W, inner_lr):
         # Save model weights before inner task training
         original_weights = weight_vars.tensors() 
@@ -147,6 +152,8 @@ def main():
         # Return the loss obtained with these new weights, but restore pre-inner-task weights
         loss, losses = inner_loss(X_val, Y_val)
         weight_vars.assign(original_weights)
+        if reg_sv > 0:
+            loss += reg_sv * (losses["/svd/sv"] - losses["/prediction/train"])
         # Calculate equivariance loss of W with respect to Ghat (does not change over inner loop)
         losses["/equivariance/W-Ghat"] = Ghat_equivariance(W)
         return loss, losses
@@ -181,7 +188,15 @@ def main():
     for epoch in tqdm(range(outer_epochs),desc='outer loop'):
         Xs_train, Ys_train, Xs_val, Ys_val, Ws = sample_tasks(inner_batch_size, outer_batch_size, return_Ws=True)
         loss, training_losses = \
-                train_op(Xs_train, Ys_train, Xs_val, Ys_val, Ws, inner_lr, outer_lr)
+            train_op(Xs_train, Ys_train, Xs_val, Ys_val, Ws, inner_lr, outer_lr)
+        #except:
+        #    print(model.network[0].linear.W)
+        #    print(model.network[1].linear.W)
+        #    print(Ghat.lie_algebra)
+        #    breakpoint()
+        #    model.network[0].linear.equivariance_loss(Ghat,ord=ord)
+        #    model.network[1].linear.equivariance_loss(Ghat,ord=ord)
+        #    return
 
         for loss_name, loss_value in training_losses.items():
             losses[loss_name].append((epoch, loss_value))

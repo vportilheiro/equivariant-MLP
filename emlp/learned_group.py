@@ -20,7 +20,7 @@ class LearnedGroup(Group,objax.Module):
     def d(self):
         return self._d
 
-def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
+def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False, offset=0):
     if (not hasattr(repin, "G")) or repin.G is None:
         repin = repin(G)
     if (not hasattr(repout, "G")) or repout.G is None:
@@ -30,7 +30,7 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
         H_out = repout.rho_dense(h)
         if W is not None:
             H_in = repin.rho_dense(h)
-            norm = jnp.linalg.norm(H_out @ W - W @ H_in, ord=ord)
+            norm = jnp.linalg.norm(H_out @ W - W @ H_in + offset, ord=ord)
             if normalize:
                 norm = norm / (jnp.linalg.norm(W, ord=ord) + jnp.linalg.norm(H_in - jnp.eye(H_in.shape[0]), ord=ord) + jnp.linalg.norm(H_out - jnp.eye(H_out.shape[0]), ord=ord))
             loss += norm
@@ -50,7 +50,7 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
         A_out = repout.drho_dense(A)
         if W is not None:
             A_in = repin.drho_dense(A)
-            norm = jnp.linalg.norm(A_out @ W - W @ A_in, ord=ord)
+            norm = jnp.linalg.norm(A_out @ W - W @ A_in + offset, ord=ord)
             if normalize:
                 norm = norm / (jnp.linalg.norm(W, ord=ord) + jnp.linalg.norm(A_in, ord=ord) + jnp.linalg.norm(A_out, ord=ord))
             loss += norm
@@ -64,31 +64,63 @@ def equivariance_loss(G, repin, repout, W=None, b=None, ord=2, normalize=False):
             loss += norm_sq
     return loss / (len(G.discrete_generators) + len(G.lie_algebra))
 
-def data_fhat_equivariance_loss(G, repin, repout, x, y, fhat, ord=2):
+def data_fhat_equivariance_loss(G, repin, repout, x, y, fhat):
+    if (not hasattr(repin, "G")) or repin.G is None:
+        repin = repin(G)
+    if (not hasattr(repout, "G")) or repout.G is None:
+        repout = repout(G)
+
+    loss = 0
+    for h in G.discrete_generators:
+        M_in = repin.rho_dense(h)
+        M_out = repout.rho_dense(h)
+        E = (M_out @ y[...,jnp.newaxis]).squeeze() - fhat((M_in @ x[...,jnp.newaxis]).squeeze())
+        squared_norms = E[..., jnp.newaxis, :] @ E[..., jnp.newaxis]
+        loss += squared_norms.mean()
+    for A in G.lie_algebra:
+        M_in = repin.drho_dense(A)
+        M_out = repout.drho_dense(A)
+        E = (M_out @ y[...,jnp.newaxis]).squeeze() - fhat((M_in @ x[...,jnp.newaxis]).squeeze())
+        squared_norms = E[..., jnp.newaxis, :] @ E[..., jnp.newaxis]
+        loss += squared_norms.mean()
+    return loss / (len(G.discrete_generators) + len(G.lie_algebra))
+
+def sampled_equivariance_loss(G, repin, repout, n_samples, W=None, b=None, ord=2, normalize=False):
     if (not hasattr(repin, "G")) or repin.G is None:
         repin = repin(G)
     if (not hasattr(repout, "G")) or repout.G is None:
         repout = repout(G)
     loss = 0
-    for h in G.discrete_generators:
-        H_in = repin.rho_dense(h)
-        H_out = repout.rho_dense(h)
-        loss += jnp.linalg.norm(
-                (H_out @ y[...,jnp.newaxis]).squeeze() - fhat((H_in @ x[...,jnp.newaxis]).squeeze()), 
-                ord=ord, axis=-1).mean()
-    for A in G.lie_algebra:
-        A_in = repin.drho_dense(A)
-        A_out = repout.drho_dense(A)
-        #loss += (y @ A_out.T - fhat(x @ A_in.T)).mean()
-        loss += jnp.linalg.norm((A_out @ y[...,jnp.newaxis]).squeeze() - fhat((A_in @ x[...,jnp.newaxis]).squeeze()), ord=ord, axis=-1).mean()
+    elements = G.samples(n_samples)
+    for e in elements:
+        M_out = repout.rho_dense(e)
+        if W is not None:
+            M_in = repin.rho_dense(e)
+            norm = jnp.linalg.norm(M_out @ W - W @ M_in, ord=ord)
+            if normalize:
+                norm = norm / (jnp.linalg.norm(W, ord=ord) + jnp.linalg.norm(M_in - jnp.eye(M_in.shape[0]), ord=ord) + jnp.linalg.norm(M_out - jnp.eye(M_out.shape[0]), ord=ord))
+            loss += norm
+        #loss += jnp.linalg.norm(((repin >> repout).rho_dense(h) @ W.reshape(-1)).reshape(W.shape) - W, ord=ord)
+
+        # NOTE: we have to be quite careful here, since taking the gradient of a 2-norm when the vector
+        # is 0 gives a NaN (https://github.com/google/jax/issues/3058). For this reason we just take the
+        # square norm given by the inned product.
+        if b is not None:
+            diff = M_out @ b - b
+            norm_sq = diff @ diff
+            if normalize:
+                norm_sq = norm_sq / (b @ b + jnp.linalg.norm(M_out - jnp.eye(M_out.shape[0]), ord=ord)**2)
+            loss += norm_sq
+
     return loss / (len(G.discrete_generators) + len(G.lie_algebra))
+
 
 def generator_loss(G, ord=2):
         loss = 0
         for h in G.discrete_generators:
             loss += jnp.linalg.norm(h, ord=ord)
             # Penalizes being close to the identity
-            #loss -= jnp.linalg.norm(h - jnp.eye(h.shape[-1]), ord=ord)
+            #loss += 1/(jnp.linalg.norm(h - jnp.eye(h.shape[-1]), ord=ord))
         for A in G.lie_algebra:
             loss += jnp.linalg.norm(A, ord=ord)
         return loss / (len(G.discrete_generators) + len(G.lie_algebra))

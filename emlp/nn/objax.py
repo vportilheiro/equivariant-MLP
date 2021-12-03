@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import objax.nn as nn
 import objax.functional as F
 import numpy as np
-from emlp.learned_group import equivariance_loss
+from emlp.learned_group import equivariance_loss, sampled_equivariance_loss
 from emlp.reps import T,Rep,Scalar
 from emlp.reps import bilinear_weights
 from emlp.reps.product_sum_reps import SumRep
@@ -28,10 +28,21 @@ def Sequential(*args):
     return nn.Sequential(args)
 
 @export
-class Network(Module):
-    def __init__(self, G, layers):
+class SimpleBlock(Module):
+    def __init__(self, linear, nonlinearity):
+        self.linear = linear
+        self.nonlinearity = nonlinearity
+    def __call__(self, x):
+        return self.nonlinearity(self.linear(x))
+
+@export
+class SimpleNetwork(Module):
+    def __init__(self, G, repin, repout, num_layers, linear, nonlinearity):
         self.G = G
-        self.network = Sequential(*layers)
+        self.network = Sequential(*(
+            num_layers*[SimpleBlock(linear(repin(G), repout(G)), nonlinearity)] + \
+            [linear(repin(G), repout(G))]
+        ))
     def __call__(self,x):
         return self.network(x)
 
@@ -46,7 +57,8 @@ class Linear(Module):
         self.rep_W = rep_W = repout*repin.T
         self.rep_bias = rep_bias = repout
 
-        self.W_pre_proj = TrainVar(orthogonal((nout, nin)))
+        #self.W_pre_proj = TrainVar(orthogonal((nout, nin)))
+        self.W_pre_proj = TrainVar(objax.random.normal((nout, nin)))
         if use_bias:
             self.b_pre_proj = TrainVar(objax.random.uniform((nout,))/jnp.sqrt(nout))
         else:
@@ -70,14 +82,21 @@ class Linear(Module):
     def b(self):
         return self.Pb @ self.b_pre_proj#.value
 
+    @property
+    def linear(self):
+        return self
+
     def __call__(self, x): # (cin) -> (cout)
         logging.debug(f"linear in shape: {x.shape}")
         out = x @ self.W.T + self.b
         logging.debug(f"linear out shape:{out.shape}")
         return out
 
-    def equivariance_loss(self,G,ord=2):
-        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord)
+    def equivariance_loss(self,G,ord=2,offset=0):
+        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord, offset=offset)
+
+    def sampled_equivariance_loss(self,G,num_samples=1,ord=2):
+        return sampled_equivariance_loss(G, self.repin, self.repout, num_samples, self.W, self.b, ord)
 
 @export
 class ProjectionRecomputingLinear(Linear):
@@ -109,11 +128,14 @@ class ProjectionRecomputingLinear(Linear):
         We thus have a sv_loss_dict parameter, which we use to initialize a defaultdict, from representation
         to loss function. If a representation isn't in the passed parameter, the sv_loss_func is used.
         """
-    #TODO(?): implement a similar system for different sv_weight_funcs across different representations
-    def __init__(self, repin, repout, sv_weight_func=None, sv_offset=1e-4,
+    def __init__(self, repin, repout, sv_weight_func=None, sv_w_func_dict=None, sv_offset=1e-4,
                  sv_loss_func=None, sv_loss_dict=None, **kwargs):
         # Parameters dealing with projection
         self.sv_weight_func = sv_weight_func
+        self.sv_w_func_dict = defaultdict(lambda: self.sv_weight_func) # Note: the extra lambda is not a mistake
+        if sv_w_func_dict is not None:
+            self.sv_w_func_dict.update(sv_w_func_dict)
+
         self.sv_offset = sv_offset
 
         self.sv_w_dict = {}
@@ -127,7 +149,7 @@ class ProjectionRecomputingLinear(Linear):
 
     @property
     def W(self):
-        self.Pw, sv_w_W = self.rep_W.approximately_equivariant_projector(self.sv_weight_func, return_sv=True, offset=self.sv_offset)
+        self.Pw, sv_w_W = self.rep_W.approximately_equivariant_projector(self.sv_w_func_dict, return_sv=True, offset=self.sv_offset)
         self.sv_w_dict.update(sv_w_W)
         return super().W
 
@@ -135,7 +157,7 @@ class ProjectionRecomputingLinear(Linear):
     def b(self):
         # We will not calculate any projectors or losses for the bias if use_bias=False
         if self.use_bias:
-            self.Pb, sv_w_b = self.rep_bias.approximately_equivariant_projector(self.sv_weight_func, return_sv=True, offset=self.sv_offset)
+            self.Pb, sv_w_b = self.rep_bias.approximately_equivariant_projector(self.sv_w_func_dict, return_sv=True, offset=self.sv_offset)
             self.sv_w_dict.update(sv_w_b)
         return super().b
 
@@ -159,23 +181,32 @@ class NoOptProjectionRecomputingLinear(Linear):
 
     @property
     def W(self):
-        self.Pw, sv_w_W = Rep.approximately_equivariant_projector(self.rep_W, self.sv_weight_func, return_sv=True)
+        self.Pw, sv_w_W = Rep.approximately_equivariant_projector(self.rep_W, self.sv_w_func_dict, return_sv=True)
         self.sv_w_dict.update(sv_w_W)
         return super().W
 
     @property
     def b(self):
-        self.Pb, sv_w_b = Rep.approximately_equivariant_projector(self.rep_bias, elf.sv_weight_func, return_sv=True)
+        self.Pb, sv_w_b = Rep.approximately_equivariant_projector(self.rep_bias, elf.sv_w_func_dict, return_sv=True)
         self.sv_w_dict.update(sv_w_b)
         return super().b
 
 @export
-def RankKLinear(k, **kwargs_outer):
-    return lambda repin, repout, **kwargs: RankK(repin, repout, k, **{**kwargs, **kwargs_outer})
+def RankKLinear(k, rank_dict=None, **kwargs_outer):
+    return lambda repin, repout, **kwargs: RankK(repin, repout, k, rank_dict=rank_dict, **{**kwargs, **kwargs_outer})
+@export
+def RankDictLinear(rank_dict, **kwargs_outer):
+    """ NOTE: will error out if any reps not in the rank dict are used """
+    return lambda repin, repout, **kwargs: RankK(repin, repout, rank_dict=rank_dict, **{**kwargs, **kwargs_outer})
+def rank_mask(k):
+    return lambda S: jax.lax.dynamic_update_slice(jnp.zeros_like(S), jnp.ones(k), [-k])
 class RankK(ProjectionRecomputingLinear):
-    def __init__(self, repin, repout, k, **kwargs):
+    def __init__(self, repin, repout, k=None, rank_dict=None, **kwargs):
+        self.k = k
+        self.rank_dict = rank_dict
         super().__init__(repin, repout, \
-                lambda S: jax.lax.dynamic_update_slice(jnp.zeros_like(S), jnp.ones(k), [-k]),
+                sv_weight_func = None if k is None else rank_mask(k),
+                sv_w_func_dict = None if rank_dict is None else {rep: rank_mask(rank) for rep,rank in rank_dict.items()},
                 **kwargs)
 
 @export
@@ -184,7 +215,7 @@ def SoftSVDLinear(cutoff, **kwargs_outer):
 class SoftSVD(ProjectionRecomputingLinear):
     def __init__(self, repin, repout, cutoff, **kwargs):
         super().__init__(repin, repout, \
-                lambda S: jnp.exp(-0.5 * S**2 / (cutoff/3)**2),
+                sv_weight_func=lambda S: jnp.exp(-0.5 * S**2 / (cutoff/3)**2),
                 **kwargs)
 
 @export
@@ -213,8 +244,12 @@ class ApproximatingLinear(objax.Module):
             return self._b.value
         return jnp.zeros((self.repout.size(),))
     
-    def equivariance_loss(self,G,ord=2):
-        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord)
+    def equivariance_loss(self,G,ord=2,offset=0):
+        return equivariance_loss(G, self.repin, self.repout, self.W, self.b, ord, offset=offset)
+
+    def sampled_equivariance_loss(self,G,num_samples=1,ord=2):
+        return sampled_equivariance_loss(G, self.repin, self.repout, num_samples, self.W, self.b, ord)
+
 
     
 @export
